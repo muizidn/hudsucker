@@ -11,15 +11,15 @@ use hyper::{
 use std::{future::Future, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    net::TcpStream,
     task::JoinHandle,
+    net::TcpStream,
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     tungstenite::{self, Message},
     Connector, WebSocketStream,
 };
-use tracing::{error, info_span, instrument, warn, Instrument, Span};
+use tracing::{error, info_span, instrument, Instrument, Span};
 
 fn spawn_with_trace<T: Send + Sync + 'static>(
     fut: impl Future<Output = T> + Send + 'static,
@@ -108,86 +108,100 @@ where
         }
     }
 
+    fn host_addr(self, uri: &http::Uri) -> Option<String> {
+        uri.authority().map(|auth| auth.to_string())
+    }
+
+    async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
+        let mut server = TcpStream::connect(addr).await?;
+        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
+        Ok(())
+    }
+
     fn process_connect(self, mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-        let span = info_span!("process_connect");
-        let fut = async move {
-            match hyper::upgrade::on(&mut req).await {
-                Ok(mut upgraded) => {
-                    let mut buffer = [0; 4];
-                    let bytes_read = match upgraded.read(&mut buffer).await {
-                        Ok(bytes_read) => bytes_read,
-                        Err(e) => {
-                            error!("Failed to read from upgraded connection: {}", e);
-                            return;
-                        }
-                    };
-
-                    let mut upgraded = Rewind::new_buffered(
-                        upgraded,
-                        bytes::Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
-                    );
-
-                    if buffer == *b"GET " {
-                        if let Err(e) = self.serve_stream(upgraded, Scheme::HTTP).await {
-                            error!("Websocket connect error: {}", e);
-                        }
-                    } else if buffer[..2] == *b"\x16\x03" {
-                        let authority = req
-                            .uri()
-                            .authority()
-                            .expect("URI does not contain authority");
-
-                        let server_config = self
-                            .ca
-                            .gen_server_config(authority)
-                            .instrument(info_span!("gen_server_config"))
-                            .await;
-
-                        let stream = match TlsAcceptor::from(server_config).accept(upgraded).await {
-                            Ok(stream) => stream,
+        /*!req.uri().to_string().contains("apple-app-site")*/
+        if false {
+            let span = info_span!("process_connect_tunnel");
+            let fut = async move {
+                let addr = self.host_addr(req.uri()).unwrap();
+                match hyper::upgrade::on(req).await {
+                    Ok(upgraded) => {
+                        match Self::tunnel(upgraded, addr).await {
                             Err(e) => {
-                                error!("Failed to establish TLS connection: {}", e);
+                                error!("Failed to tunnel request: {}", e);
                                 return;
                             }
-                        };
-
-                        if let Err(e) = self.serve_stream(stream, Scheme::HTTPS).await {
-                            if !e.to_string().starts_with("error shutting down connection") {
-                                error!("HTTPS connect error: {}", e);
-                            }
-                        }
-                    } else {
-                        warn!(
-                            "Unknown protocol, read '{:02X?}' from upgraded connection",
-                            &buffer[..bytes_read]
-                        );
-
-                        let authority = req
-                            .uri()
-                            .authority()
-                            .expect("URI does not contain authority")
-                            .as_ref();
-
-                        let mut server = match TcpStream::connect(authority).await {
-                            Ok(server) => server,
-                            Err(e) => {
-                                error!("Failed to connect to {}: {}", authority, e);
-                                return;
-                            }
-                        };
-
-                        if let Err(e) =
-                            tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
-                        {
-                            error!("Failed to tunnel unknown protocol to {}: {}", authority, e);
+                            _ => ()
                         }
                     }
+                    Err(e) => {
+                        error!("Failed to read from upgraded connection: {}", e);
+                        return;
+                    }
                 }
-                Err(e) => error!("Upgrade error: {}", e),
             };
-        };
+            spawn_with_trace(fut, span);
+        } else {
+            let span = info_span!("process_connect_proxy");
+            let fut = async move {
+                match hyper::upgrade::on(&mut req).await {
+                    Ok(mut upgraded) => {
+                        let mut buffer = [0; 4];
+                        let bytes_read = match upgraded.read(&mut buffer).await {
+                            Ok(bytes_read) => bytes_read,
+                            Err(e) => {
+                                error!("Failed to read from upgraded connection: {}", e);
+                                return;
+                            }
+                        };
 
-        spawn_with_trace(fut, span);
+                        let upgraded = Rewind::new_buffered(
+                            upgraded,
+                            bytes::Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
+                        );
+
+                        if buffer == *b"GET " {
+                            if let Err(e) = self.serve_stream(upgraded, Scheme::HTTP).await {
+                                error!("Websocket connect error: {}", e);
+                            }
+                        } else if buffer[..2] == *b"\x16\x03" {
+                            let authority = req
+                                .uri()
+                                .authority()
+                                .expect("URI does not contain authority");
+
+                            let server_config = self
+                                .ca
+                                .gen_server_config(authority)
+                                .instrument(info_span!("gen_server_config"))
+                                .await;
+
+                            let stream =
+                                match TlsAcceptor::from(server_config).accept(upgraded).await {
+                                    Ok(stream) => stream,
+                                    Err(e) => {
+                                        error!("Failed to establish TLS connection: {}", e);
+                                        return;
+                                    }
+                                };
+
+                            if let Err(e) = self.serve_stream(stream, Scheme::HTTPS).await {
+                                if !e.to_string().starts_with("error shutting down connection") {
+                                    error!("HTTPS connect error: {}", e);
+                                }
+                            }
+                        } else {
+                            error!(
+                                "Unknown protocol, read '{:02X?}' from upgraded connection",
+                                &buffer[..bytes_read]
+                            );
+                        }
+                    }
+                    Err(e) => error!("Upgrade error: {}", e),
+                };
+            };
+            spawn_with_trace(fut, span);
+        }
         Ok(Response::new(Body::empty()))
     }
 
@@ -326,8 +340,9 @@ fn spawn_message_forwarder(
         while let Some(message) = stream.next().await {
             match message {
                 Ok(message) => {
-                    let Some(message) = handler.handle_message(&ctx, message).await else {
-                        continue
+                    let message = match handler.handle_message(&ctx, message).await {
+                        Some(message) => message,
+                        None => continue,
                     };
 
                     match sink.send(message).await {
