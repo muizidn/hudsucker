@@ -4,8 +4,9 @@ use hudsucker::{
     decode_request, decode_response,
     hyper::{
         header::{CONTENT_ENCODING, CONTENT_LENGTH},
-        Body, Request, Response,
+        Request, Response,
     },
+    Body,
 };
 use tokio::io::BufReader;
 use tokio_util::io::ReaderStream;
@@ -18,13 +19,13 @@ fn raw_body() -> Body {
 
 fn gzip_body() -> Body {
     let encoder = GzipEncoder::new(&BODY[..]);
-    Body::wrap_stream(ReaderStream::new(encoder))
+    Body::from_stream(ReaderStream::new(encoder))
 }
 
 fn gzip_brotli_body() -> Body {
     let encoder = GzipEncoder::new(&BODY[..]);
     let encoder = BrotliEncoder::new(BufReader::new(encoder));
-    Body::wrap_stream(ReaderStream::new(encoder))
+    Body::from_stream(ReaderStream::new(encoder))
 }
 
 fn raw_request() -> Request<Body> {

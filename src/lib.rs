@@ -4,18 +4,19 @@
 //!
 //! - Modify HTTP/S requests
 //! - Modify HTTP/S responses
-//! - Modify websocket messages
+//! - Modify WebSocket messages
 //!
 //! ## Features
 //!
 //! - `decoder`: Enables [`decode_request`] and [`decode_response`] helpers (enabled by default).
 //! - `full`: Enables all features.
 //! - `http2`: Enables HTTP/2 support.
-//! - `native-tls-client`: Enables [`ProxyBuilder::with_native_tls_client`].
-//! - `openssl-ca`: Enables [`certificate_authority::OpensslAuthority`].
-//! - `rcgen-ca`: Enables [`certificate_authority::RcgenAuthority`] (enabled by default).
-//! - `rustls-client`: Enables [`ProxyBuilder::with_rustls_client`] (enabled by default).
+//! - `native-tls-client`: Enables [`ProxyBuilder::with_native_tls_client`](builder::ProxyBuilder::with_native_tls_client).
+//! - `openssl-ca`: Enables [`OpensslAuthority`](certificate_authority::OpensslAuthority).
+//! - `rcgen-ca`: Enables [`RcgenAuthority`](certificate_authority::RcgenAuthority) (enabled by default).
+//! - `rustls-client`: Enables [`ProxyBuilder::with_rustls_client`](builder::ProxyBuilder::with_rustls_client) (enabled by default).
 
+mod body;
 #[cfg(feature = "decoder")]
 mod decoder;
 mod error;
@@ -25,19 +26,23 @@ mod rewind;
 
 pub mod certificate_authority;
 
-use hyper::{Body, Request, Response, Uri};
-use std::net::SocketAddr;
-use tokio_tungstenite::tungstenite::Message;
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use hyper::{Request, Response, StatusCode, Uri};
+use std::{future::Future, net::SocketAddr};
+use tokio_tungstenite::tungstenite::{self, Message};
+use tracing::error;
 
-pub(crate) use rewind::Rewind;
-
-pub use async_trait;
+pub use futures;
 pub use hyper;
+pub use hyper_util;
 #[cfg(feature = "openssl-ca")]
 pub use openssl;
+#[cfg(feature = "rcgen-ca")]
+pub use rcgen;
 pub use tokio_rustls::rustls;
 pub use tokio_tungstenite;
 
+pub use body::Body;
 #[cfg(feature = "decoder")]
 pub use decoder::{decode_request, decode_response};
 pub use error::Error;
@@ -95,38 +100,102 @@ pub enum WebSocketContext {
 /// Handler for HTTP requests and responses.
 ///
 /// Each request/response pair is passed to the same instance of the handler.
-#[async_trait::async_trait]
 pub trait HttpHandler: Clone + Send + Sync + 'static {
-    /// The handler will be called for each HTTP request. It can either return a modified request,
+    /// This handler will be called for each HTTP request. It can either return a modified request,
     /// or a response. If a request is returned, it will be sent to the upstream server. If a
     /// response is returned, it will be sent to the client.
-    async fn handle_request(
+    fn handle_request(
         &mut self,
         _ctx: &HttpContext,
         req: Request<Body>,
-    ) -> RequestOrResponse {
-        req.into()
+    ) -> impl Future<Output = RequestOrResponse> + Send {
+        async { req.into() }
     }
 
-    /// The handler will be called for each HTTP response. It can modify a response before it is
+    /// This handler will be called for each HTTP response. It can modify a response before it is
     /// forwarded to the client.
-    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        res
+    fn handle_response(
+        &mut self,
+        _ctx: &HttpContext,
+        res: Response<Body>,
+    ) -> impl Future<Output = Response<Body>> + Send {
+        async { res }
+    }
+
+    /// This handler will be called if a proxy request fails. Default response is a 502 Bad Gateway.
+    fn handle_error(
+        &mut self,
+        _ctx: &HttpContext,
+        err: hyper_util::client::legacy::Error,
+    ) -> impl Future<Output = Response<Body>> + Send {
+        async move {
+            error!("Failed to forward request: {}", err);
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::empty())
+                .expect("Failed to build response")
+        }
+    }
+
+    /// Whether a CONNECT request should be intercepted. Defaults to `true` for all requests.
+    fn should_intercept(
+        &mut self,
+        _ctx: &HttpContext,
+        _req: &Request<Body>,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
     }
 }
 
-/// Handler for websocket messages.
+/// Handler for WebSocket messages.
 ///
-/// Messages sent over the same websocket stream are passed to the same instance of the handler.
-#[async_trait::async_trait]
+/// Messages sent over the same WebSocket Stream are passed to the same instance of the handler.
 pub trait WebSocketHandler: Clone + Send + Sync + 'static {
-    /// The handler will be called for each websocket message. It can return an optional modified
+    /// This handler is responsible for forwarding WebSocket messages from a Stream to a Sink and
+    /// recovering from any potential errors.
+    fn handle_websocket(
+        mut self,
+        ctx: WebSocketContext,
+        mut stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+        mut sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    ) -> impl Future<Output = ()> + Send {
+        async move {
+            while let Some(message) = stream.next().await {
+                match message {
+                    Ok(message) => {
+                        let Some(message) = self.handle_message(&ctx, message).await else {
+                            continue;
+                        };
+
+                        match sink.send(message).await {
+                            Err(tungstenite::Error::ConnectionClosed) => (),
+                            Err(e) => error!("WebSocket send error: {}", e),
+                            _ => (),
+                        }
+                    }
+                    Err(e) => {
+                        error!("WebSocket message error: {}", e);
+
+                        match sink.send(Message::Close(None)).await {
+                            Err(tungstenite::Error::ConnectionClosed) => (),
+                            Err(e) => error!("WebSocket close error: {}", e),
+                            _ => (),
+                        };
+
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// This handler will be called for each WebSocket message. It can return an optional modified
     /// message. If None is returned the message will not be forwarded.
-    async fn handle_message(
+    fn handle_message(
         &mut self,
         _ctx: &WebSocketContext,
         message: Message,
-    ) -> Option<Message> {
-        Some(message)
+    ) -> impl Future<Output = Option<Message>> + Send {
+        async { Some(message) }
     }
 }

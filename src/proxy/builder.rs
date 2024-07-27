@@ -1,18 +1,25 @@
 use crate::{
-    certificate_authority::CertificateAuthority, HttpHandler, NoopHandler, Proxy, WebSocketHandler,
-};
-use hyper::{
-    client::{connect::Connect, Client, HttpConnector},
-    server::conn::AddrIncoming,
+    certificate_authority::CertificateAuthority, Body, HttpHandler, NoopHandler, Proxy,
+    WebSocketHandler,
 };
 #[cfg(feature = "rustls-client")]
 use hyper_rustls::{HttpsConnector as RustlsConnector, HttpsConnectorBuilder};
 #[cfg(feature = "native-tls-client")]
 use hyper_tls::HttpsConnector as NativeTlsConnector;
+use hyper_util::{
+    client::legacy::{
+        connect::{Connect, HttpConnector},
+        Client,
+    },
+    rt::TokioExecutor,
+    server::conn::auto::Builder,
+};
 use std::{
-    net::{SocketAddr, TcpListener},
+    future::{pending, Future, Pending},
+    net::SocketAddr,
     sync::Arc,
 };
+use tokio::net::TcpListener;
 use tokio_tungstenite::Connector;
 
 /// A builder for creating a [`Proxy`].
@@ -23,25 +30,20 @@ use tokio_tungstenite::Connector;
 /// # #[cfg(all(feature = "rcgen-ca", feature = "rustls-client"))]
 /// # {
 /// use hudsucker::Proxy;
-/// # use hudsucker::certificate_authority::RcgenAuthority;
-/// # use rustls_pemfile as pemfile;
-/// # use tokio_rustls::rustls;
+/// # use hudsucker::{
+/// #     certificate_authority::RcgenAuthority,
+/// #     rcgen::{CertificateParams, KeyPair},
+/// # };
 /// #
-/// # let mut private_key_bytes: &[u8] = include_bytes!("../../examples/ca/hudsucker.key");
-/// # let mut ca_cert_bytes: &[u8] = include_bytes!("../../examples/ca/hudsucker.cer");
-/// # let private_key = rustls::PrivateKey(
-/// #     pemfile::pkcs8_private_keys(&mut private_key_bytes)
-/// #         .expect("Failed to parse private key")
-/// #         .remove(0),
-/// # );
-/// # let ca_cert = rustls::Certificate(
-/// #     pemfile::certs(&mut ca_cert_bytes)
-/// #         .expect("Failed to parse CA certificate")
-/// #         .remove(0),
-/// # );
+/// # let key_pair = include_str!("../../examples/ca/hudsucker.key");
+/// # let ca_cert = include_str!("../../examples/ca/hudsucker.cer");
+/// # let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
+/// # let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
+/// #     .expect("Failed to parse CA certificate")
+/// #     .self_signed(&key_pair)
+/// #     .expect("Failed to sign CA certificate");
 /// #
-/// # let ca = RcgenAuthority::new(private_key, ca_cert, 1_000)
-/// #     .expect("Failed to create Certificate Authority");
+/// # let ca = RcgenAuthority::new(key_pair, ca_cert, 1_000);
 ///
 /// // let ca = ...;
 ///
@@ -60,10 +62,9 @@ pub struct ProxyBuilder<T>(T);
 pub struct WantsAddr(());
 
 #[derive(Debug)]
-pub(crate) enum AddrListenerServer {
+pub(crate) enum AddrOrListener {
     Addr(SocketAddr),
     Listener(TcpListener),
-    Server(Box<hyper::server::Builder<AddrIncoming>>),
 }
 
 impl ProxyBuilder<WantsAddr> {
@@ -75,24 +76,14 @@ impl ProxyBuilder<WantsAddr> {
     /// Set the address to listen on.
     pub fn with_addr(self, addr: SocketAddr) -> ProxyBuilder<WantsClient> {
         ProxyBuilder(WantsClient {
-            als: AddrListenerServer::Addr(addr),
+            al: AddrOrListener::Addr(addr),
         })
     }
 
     /// Set a listener to use for the proxy server.
     pub fn with_listener(self, listener: TcpListener) -> ProxyBuilder<WantsClient> {
         ProxyBuilder(WantsClient {
-            als: AddrListenerServer::Listener(listener),
-        })
-    }
-
-    /// Set a custom server builder to use for the proxy server.
-    pub fn with_server(
-        self,
-        server: hyper::server::Builder<AddrIncoming>,
-    ) -> ProxyBuilder<WantsClient> {
-        ProxyBuilder(WantsClient {
-            als: AddrListenerServer::Server(Box::new(server)),
+            al: AddrOrListener::Listener(listener),
         })
     }
 }
@@ -106,7 +97,7 @@ impl Default for ProxyBuilder<WantsAddr> {
 /// Builder state that needs a client.
 #[derive(Debug)]
 pub struct WantsClient {
-    als: AddrListenerServer,
+    al: AddrOrListener,
 }
 
 impl ProxyBuilder<WantsClient> {
@@ -125,8 +116,8 @@ impl ProxyBuilder<WantsClient> {
         let https = https.build();
 
         ProxyBuilder(WantsCa {
-            als: self.0.als,
-            client: Client::builder()
+            al: self.0.al,
+            client: Client::builder(TokioExecutor::new())
                 .http1_title_case_headers(true)
                 .http1_preserve_header_case(true)
                 .build(https),
@@ -142,8 +133,8 @@ impl ProxyBuilder<WantsClient> {
         let https = NativeTlsConnector::new();
 
         ProxyBuilder(WantsCa {
-            als: self.0.als,
-            client: Client::builder()
+            al: self.0.al,
+            client: Client::builder(TokioExecutor::new())
                 .http1_title_case_headers(true)
                 .http1_preserve_header_case(true)
                 .build(https),
@@ -151,12 +142,12 @@ impl ProxyBuilder<WantsClient> {
     }
 
     /// Use a custom client.
-    pub fn with_client<C>(self, client: Client<C>) -> ProxyBuilder<WantsCa<C>>
+    pub fn with_client<C>(self, client: Client<C, Body>) -> ProxyBuilder<WantsCa<C>>
     where
         C: Connect + Clone + Send + Sync + 'static,
     {
         ProxyBuilder(WantsCa {
-            als: self.0.als,
+            al: self.0.al,
             client,
         })
     }
@@ -165,8 +156,8 @@ impl ProxyBuilder<WantsClient> {
 /// Builder state that needs a certificate authority.
 #[derive(Debug)]
 pub struct WantsCa<C> {
-    als: AddrListenerServer,
-    client: Client<C>,
+    al: AddrOrListener,
+    client: Client<C, Body>,
 }
 
 impl<C> ProxyBuilder<WantsCa<C>> {
@@ -174,41 +165,47 @@ impl<C> ProxyBuilder<WantsCa<C>> {
     pub fn with_ca<CA: CertificateAuthority>(
         self,
         ca: CA,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, NoopHandler, NoopHandler>> {
+    ) -> ProxyBuilder<WantsHandlers<C, CA, NoopHandler, NoopHandler, Pending<()>>> {
         ProxyBuilder(WantsHandlers {
-            als: self.0.als,
+            al: self.0.al,
             client: self.0.client,
             ca,
             http_handler: NoopHandler::new(),
             websocket_handler: NoopHandler::new(),
             websocket_connector: None,
+            server: None,
+            graceful_shutdown: pending(),
         })
     }
 }
 
 /// Builder state that can take additional handlers.
-pub struct WantsHandlers<C, CA, H, W> {
-    als: AddrListenerServer,
-    client: Client<C>,
+pub struct WantsHandlers<C, CA, H, W, F> {
+    al: AddrOrListener,
+    client: Client<C, Body>,
     ca: CA,
     http_handler: H,
     websocket_handler: W,
     websocket_connector: Option<Connector>,
+    server: Option<Builder<TokioExecutor>>,
+    graceful_shutdown: F,
 }
 
-impl<C, CA, H, W> ProxyBuilder<WantsHandlers<C, CA, H, W>> {
+impl<C, CA, H, W, F> ProxyBuilder<WantsHandlers<C, CA, H, W, F>> {
     /// Set the HTTP handler.
     pub fn with_http_handler<H2: HttpHandler>(
         self,
         http_handler: H2,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, H2, W>> {
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H2, W, F>> {
         ProxyBuilder(WantsHandlers {
-            als: self.0.als,
+            al: self.0.al,
             client: self.0.client,
             ca: self.0.ca,
             http_handler,
             websocket_handler: self.0.websocket_handler,
             websocket_connector: self.0.websocket_connector,
+            server: self.0.server,
+            graceful_shutdown: self.0.graceful_shutdown,
         })
     }
 
@@ -216,14 +213,16 @@ impl<C, CA, H, W> ProxyBuilder<WantsHandlers<C, CA, H, W>> {
     pub fn with_websocket_handler<W2: WebSocketHandler>(
         self,
         websocket_handler: W2,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, H, W2>> {
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H, W2, F>> {
         ProxyBuilder(WantsHandlers {
-            als: self.0.als,
+            al: self.0.al,
             client: self.0.client,
             ca: self.0.ca,
             http_handler: self.0.http_handler,
             websocket_handler,
             websocket_connector: self.0.websocket_connector,
+            server: self.0.server,
+            graceful_shutdown: self.0.graceful_shutdown,
         })
     }
 
@@ -235,15 +234,42 @@ impl<C, CA, H, W> ProxyBuilder<WantsHandlers<C, CA, H, W>> {
         })
     }
 
+    /// Set a custom server builder to use for the proxy server.
+    pub fn with_server(self, server: Builder<TokioExecutor>) -> Self {
+        ProxyBuilder(WantsHandlers {
+            server: Some(server),
+            ..self.0
+        })
+    }
+
+    /// Set a future that when ready will gracefully shutdown the proxy server.
+    pub fn with_graceful_shutdown<F2: Future<Output = ()> + Send + 'static>(
+        self,
+        graceful_shutdown: F2,
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H, W, F2>> {
+        ProxyBuilder(WantsHandlers {
+            al: self.0.al,
+            client: self.0.client,
+            ca: self.0.ca,
+            http_handler: self.0.http_handler,
+            websocket_handler: self.0.websocket_handler,
+            websocket_connector: self.0.websocket_connector,
+            server: self.0.server,
+            graceful_shutdown,
+        })
+    }
+
     /// Build the proxy.
-    pub fn build(self) -> Proxy<C, CA, H, W> {
+    pub fn build(self) -> Proxy<C, CA, H, W, F> {
         Proxy {
-            als: self.0.als,
+            al: self.0.al,
             client: self.0.client,
             ca: Arc::new(self.0.ca),
             http_handler: self.0.http_handler,
             websocket_handler: self.0.websocket_handler,
             websocket_connector: self.0.websocket_connector,
+            server: self.0.server,
+            graceful_shutdown: self.0.graceful_shutdown,
         }
     }
 }

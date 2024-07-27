@@ -1,25 +1,36 @@
 use crate::{
-    certificate_authority::CertificateAuthority, HttpContext, HttpHandler, RequestOrResponse,
-    Rewind, WebSocketContext, WebSocketHandler,
+    body::Body, certificate_authority::CertificateAuthority, rewind::Rewind, HttpContext,
+    HttpHandler, RequestOrResponse, WebSocketContext, WebSocketHandler,
 };
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{Sink, Stream, StreamExt};
 use http::uri::{Authority, Scheme};
 use hyper::{
-    client::connect::Connect, header::Entry, server::conn::Http, service::service_fn,
-    upgrade::Upgraded, Body, Client, Method, Request, Response, Uri,
+    body::{Bytes, Incoming},
+    header::Entry,
+    service::service_fn,
+    upgrade::Upgraded,
+    Method, Request, Response, StatusCode, Uri,
 };
-use std::{future::Future, net::SocketAddr, sync::Arc};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    task::JoinHandle,
-    net::TcpStream,
+use hyper_util::{
+    client::legacy::{connect::Connect, Client},
+    rt::{TokioExecutor, TokioIo},
+    server,
 };
+use std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc};
+use tokio::{io::AsyncReadExt, net::TcpStream, task::JoinHandle};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     tungstenite::{self, Message},
     Connector, WebSocketStream,
 };
-use tracing::{error, info_span, instrument, Instrument, Span};
+use tracing::{error, info_span, instrument, warn, Instrument, Span};
+
+fn bad_request() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Body::empty())
+        .expect("Failed to build response")
+}
 
 fn spawn_with_trace<T: Send + Sync + 'static>(
     fut: impl Future<Output = T> + Send + 'static,
@@ -30,7 +41,8 @@ fn spawn_with_trace<T: Send + Sync + 'static>(
 
 pub(crate) struct InternalProxy<C, CA, H, W> {
     pub ca: Arc<CA>,
-    pub client: Client<C>,
+    pub client: Client<C, Body>,
+    pub server: server::conn::auto::Builder<TokioExecutor>,
     pub http_handler: H,
     pub websocket_handler: W,
     pub websocket_connector: Option<Connector>,
@@ -47,6 +59,7 @@ where
         InternalProxy {
             ca: Arc::clone(&self.ca),
             client: self.client.clone(),
+            server: self.server.clone(),
             http_handler: self.http_handler.clone(),
             websocket_handler: self.websocket_handler.clone(),
             websocket_connector: self.websocket_connector.clone(),
@@ -62,6 +75,12 @@ where
     H: HttpHandler,
     W: WebSocketHandler,
 {
+    fn context(&self) -> HttpContext {
+        HttpContext {
+            client_addr: self.client_addr,
+        }
+    }
+
     #[instrument(
         skip_all,
         fields(
@@ -73,15 +92,13 @@ where
     )]
     pub(crate) async fn proxy(
         mut self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, hyper::Error> {
-        let ctx = HttpContext {
-            client_addr: self.client_addr,
-        };
+        req: Request<Incoming>,
+    ) -> Result<Response<Body>, Infallible> {
+        let ctx = self.context();
 
         let req = match self
             .http_handler
-            .handle_request(&ctx, req)
+            .handle_request(&ctx, req.map(Body::from))
             .instrument(info_span!("handle_request"))
             .await
         {
@@ -90,7 +107,7 @@ where
         };
 
         if req.method() == Method::CONNECT {
-            self.process_connect(req)
+            Ok(self.process_connect(req))
         } else if hyper_tungstenite::is_upgrade_request(&req) {
             Ok(self.upgrade_websocket(req))
         } else {
@@ -98,111 +115,124 @@ where
                 .client
                 .request(normalize_request(req))
                 .instrument(info_span!("proxy_request"))
-                .await?;
+                .await;
 
-            Ok(self
-                .http_handler
-                .handle_response(&ctx, res)
-                .instrument(info_span!("handle_response"))
-                .await)
+            match res {
+                Ok(res) => Ok(self
+                    .http_handler
+                    .handle_response(&ctx, res.map(Body::from))
+                    .instrument(info_span!("handle_response"))
+                    .await),
+                Err(err) => Ok(self
+                    .http_handler
+                    .handle_error(&ctx, err)
+                    .instrument(info_span!("handle_error"))
+                    .await),
+            }
         }
     }
 
-    fn host_addr(self, uri: &http::Uri) -> Option<String> {
-        uri.authority().map(|auth| auth.to_string())
-    }
+    fn process_connect(mut self, mut req: Request<Body>) -> Response<Body> {
+        match req.uri().authority().cloned() {
+            Some(authority) => {
+                let span = info_span!("process_connect");
+                let fut = async move {
+                    match hyper::upgrade::on(&mut req).await {
+                        Ok(upgraded) => {
+                            let mut upgraded = TokioIo::new(upgraded);
+                            let mut buffer = [0; 4];
+                            let bytes_read = match upgraded.read(&mut buffer).await {
+                                Ok(bytes_read) => bytes_read,
+                                Err(e) => {
+                                    error!("Failed to read from upgraded connection: {}", e);
+                                    return;
+                                }
+                            };
 
-    async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
-        let mut server = TcpStream::connect(addr).await?;
-        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
-        Ok(())
-    }
+                            let mut upgraded = Rewind::new(
+                                upgraded,
+                                Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
+                            );
 
-    fn process_connect(self, mut req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-        /*!req.uri().to_string().contains("apple-app-site")*/
-        if false {
-            let span = info_span!("process_connect_tunnel");
-            let fut = async move {
-                let addr = self.host_addr(req.uri()).unwrap();
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        match Self::tunnel(upgraded, addr).await {
-                            Err(e) => {
-                                error!("Failed to tunnel request: {}", e);
-                                return;
-                            }
-                            _ => ()
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read from upgraded connection: {}", e);
-                        return;
-                    }
-                }
-            };
-            spawn_with_trace(fut, span);
-        } else {
-            let span = info_span!("process_connect_proxy");
-            let fut = async move {
-                match hyper::upgrade::on(&mut req).await {
-                    Ok(mut upgraded) => {
-                        let mut buffer = [0; 4];
-                        let bytes_read = match upgraded.read(&mut buffer).await {
-                            Ok(bytes_read) => bytes_read,
-                            Err(e) => {
-                                error!("Failed to read from upgraded connection: {}", e);
-                                return;
-                            }
-                        };
-
-                        let upgraded = Rewind::new_buffered(
-                            upgraded,
-                            bytes::Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
-                        );
-
-                        if buffer == *b"GET " {
-                            if let Err(e) = self.serve_stream(upgraded, Scheme::HTTP).await {
-                                error!("Websocket connect error: {}", e);
-                            }
-                        } else if buffer[..2] == *b"\x16\x03" {
-                            let authority = req
-                                .uri()
-                                .authority()
-                                .expect("URI does not contain authority");
-
-                            let server_config = self
-                                .ca
-                                .gen_server_config(authority)
-                                .instrument(info_span!("gen_server_config"))
-                                .await;
-
-                            let stream =
-                                match TlsAcceptor::from(server_config).accept(upgraded).await {
-                                    Ok(stream) => stream,
-                                    Err(e) => {
-                                        error!("Failed to establish TLS connection: {}", e);
-                                        return;
+                            if self
+                                .http_handler
+                                .should_intercept(&self.context(), &req)
+                                .await
+                            {
+                                if buffer == *b"GET " {
+                                    if let Err(e) = self
+                                        .serve_stream(
+                                            TokioIo::new(upgraded),
+                                            Scheme::HTTP,
+                                            authority,
+                                        )
+                                        .await
+                                    {
+                                        error!("WebSocket connect error: {}", e);
                                     }
-                                };
 
-                            if let Err(e) = self.serve_stream(stream, Scheme::HTTPS).await {
-                                if !e.to_string().starts_with("error shutting down connection") {
-                                    error!("HTTPS connect error: {}", e);
+                                    return;
+                                } else if buffer[..2] == *b"\x16\x03" {
+                                    let server_config = self
+                                        .ca
+                                        .gen_server_config(&authority)
+                                        .instrument(info_span!("gen_server_config"))
+                                        .await;
+
+                                    let stream = match TlsAcceptor::from(server_config)
+                                        .accept(upgraded)
+                                        .await
+                                    {
+                                        Ok(stream) => TokioIo::new(stream),
+                                        Err(e) => {
+                                            error!("Failed to establish TLS connection: {}", e);
+                                            return;
+                                        }
+                                    };
+
+                                    if let Err(e) =
+                                        self.serve_stream(stream, Scheme::HTTPS, authority).await
+                                    {
+                                        if !e
+                                            .to_string()
+                                            .starts_with("error shutting down connection")
+                                        {
+                                            error!("HTTPS connect error: {}", e);
+                                        }
+                                    }
+
+                                    return;
+                                } else {
+                                    warn!(
+                                        "Unknown protocol, read '{:02X?}' from upgraded connection",
+                                        &buffer[..bytes_read]
+                                    );
                                 }
                             }
-                        } else {
-                            error!(
-                                "Unknown protocol, read '{:02X?}' from upgraded connection",
-                                &buffer[..bytes_read]
-                            );
+
+                            let mut server = match TcpStream::connect(authority.as_ref()).await {
+                                Ok(server) => server,
+                                Err(e) => {
+                                    error!("Failed to connect to {}: {}", authority, e);
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) =
+                                tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                            {
+                                error!("Failed to tunnel to {}: {}", authority, e);
+                            }
                         }
-                    }
-                    Err(e) => error!("Upgrade error: {}", e),
+                        Err(e) => error!("Upgrade error: {}", e),
+                    };
                 };
-            };
-            spawn_with_trace(fut, span);
+
+                spawn_with_trace(fut, span);
+                Response::new(Body::empty())
+            }
+            None => bad_request(),
         }
-        Ok(Response::new(Body::empty()))
     }
 
     #[instrument(skip_all)]
@@ -219,48 +249,59 @@ where
                     Some("wss".try_into().expect("Failed to convert scheme"))
                 };
 
-                Uri::from_parts(parts).expect("Failed to build URI")
+                match Uri::from_parts(parts) {
+                    Ok(uri) => uri,
+                    Err(_) => {
+                        return bad_request();
+                    }
+                }
             };
 
             Request::from_parts(parts, ())
         };
 
-        let (res, websocket) =
-            hyper_tungstenite::upgrade(&mut req, None).expect("Request has missing headers");
-
-        let span = info_span!("websocket");
-        let fut = async move {
-            match websocket.await {
-                Ok(ws) => {
-                    if let Err(e) = self.handle_websocket(ws, req).await {
-                        error!("Failed to handle websocket: {}", e);
+        match hyper_tungstenite::upgrade(&mut req, None) {
+            Ok((res, websocket)) => {
+                let span = info_span!("websocket");
+                let fut = async move {
+                    match websocket.await {
+                        Ok(ws) => {
+                            if let Err(e) = self.handle_websocket(ws, req).await {
+                                error!("Failed to handle WebSocket: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to upgrade to WebSocket: {}", e);
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to upgrade to websocket: {}", e);
-                }
-            }
-        };
+                };
 
-        spawn_with_trace(fut, span);
-        res
+                spawn_with_trace(fut, span);
+                res.map(Body::from)
+            }
+            Err(_) => bad_request(),
+        }
     }
 
     #[instrument(skip_all)]
     async fn handle_websocket(
         self,
-        server_socket: WebSocketStream<Upgraded>,
+        client_socket: WebSocketStream<TokioIo<Upgraded>>,
         req: Request<()>,
     ) -> Result<(), tungstenite::Error> {
         let uri = req.uri().clone();
 
         #[cfg(any(feature = "rustls-client", feature = "native-tls-client"))]
-        let (client_socket, _) =
-            tokio_tungstenite::connect_async_tls_with_config(req, None, self.websocket_connector)
-                .await?;
+        let (server_socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            None,
+            false,
+            self.websocket_connector,
+        )
+        .await?;
 
         #[cfg(not(any(feature = "rustls-client", feature = "native-tls-client")))]
-        let (client_socket, _) = tokio_tungstenite::connect_async(req).await?;
+        let (server_socket, _) = tokio_tungstenite::connect_async(req).await?;
 
         let (server_sink, server_stream) = server_socket.split();
         let (client_sink, client_stream) = client_socket.split();
@@ -293,26 +334,24 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn serve_stream<I>(self, stream: I, scheme: Scheme) -> Result<(), hyper::Error>
+    async fn serve_stream<I>(
+        self,
+        stream: I,
+        scheme: Scheme,
+        authority: Authority,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
-        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {
         let service = service_fn(|mut req| {
             if req.version() == hyper::Version::HTTP_10 || req.version() == hyper::Version::HTTP_11
             {
                 let (mut parts, body) = req.into_parts();
 
-                let authority = parts
-                    .headers
-                    .get(hyper::header::HOST)
-                    .expect("Host is a required header")
-                    .as_bytes();
-
                 parts.uri = {
                     let mut parts = parts.uri.into_parts();
                     parts.scheme = Some(scheme.clone());
-                    parts.authority =
-                        Some(Authority::try_from(authority).expect("Failed to parse authority"));
+                    parts.authority = Some(authority.clone());
                     Uri::from_parts(parts).expect("Failed to build URI")
                 };
 
@@ -322,50 +361,20 @@ where
             self.clone().proxy(req)
         });
 
-        Http::new()
-            .serve_connection(stream, service)
-            .with_upgrades()
+        self.server
+            .serve_connection_with_upgrades(stream, service)
             .await
     }
 }
 
 fn spawn_message_forwarder(
-    mut stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
-    mut sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
-    mut handler: impl WebSocketHandler,
+    stream: impl Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+    sink: impl Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static,
+    handler: impl WebSocketHandler,
     ctx: WebSocketContext,
 ) {
     let span = info_span!("message_forwarder", context = ?ctx);
-    let fut = async move {
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(message) => {
-                    let message = match handler.handle_message(&ctx, message).await {
-                        Some(message) => message,
-                        None => continue,
-                    };
-
-                    match sink.send(message).await {
-                        Err(tungstenite::Error::ConnectionClosed) => (),
-                        Err(e) => error!("Websocket send error: {}", e),
-                        _ => (),
-                    }
-                }
-                Err(e) => {
-                    error!("Websocket message error: {}", e);
-
-                    match sink.send(Message::Close(None)).await {
-                        Err(tungstenite::Error::ConnectionClosed) => (),
-                        Err(e) => error!("Websocket close error: {}", e),
-                        _ => (),
-                    };
-
-                    break;
-                }
-            }
-        }
-    };
-
+    let fut = handler.handle_websocket(ctx, stream, sink);
     spawn_with_trace(fut, span);
 }
 
@@ -387,6 +396,38 @@ fn normalize_request<T>(mut req: Request<T>) -> Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper_util::client::legacy::connect::HttpConnector;
+    use tokio_rustls::rustls::ServerConfig;
+
+    struct CA;
+
+    impl CertificateAuthority for CA {
+        async fn gen_server_config(&self, _authority: &Authority) -> Arc<ServerConfig> {
+            unimplemented!();
+        }
+    }
+
+    fn build_proxy() -> InternalProxy<HttpConnector, CA, crate::NoopHandler, crate::NoopHandler> {
+        InternalProxy {
+            ca: Arc::new(CA),
+            client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            server: server::conn::auto::Builder::new(TokioExecutor::new()),
+            http_handler: crate::NoopHandler::new(),
+            websocket_handler: crate::NoopHandler::new(),
+            websocket_connector: None,
+            client_addr: "127.0.0.1:8080".parse().unwrap(),
+        }
+    }
+
+    mod bad_request {
+        use super::*;
+
+        #[test]
+        fn correct_status() {
+            let res = bad_request();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+    }
 
     mod normalize_request {
         use super::*;
@@ -424,6 +465,56 @@ mod tests {
                 req.headers().get(hyper::header::COOKIE),
                 Some(&"foo=bar; baz=qux".parse().unwrap())
             );
+        }
+    }
+
+    mod process_connect {
+        use super::*;
+
+        #[test]
+        fn returns_bad_request_if_missing_authority() {
+            let proxy = build_proxy();
+
+            let req = Request::builder()
+                .uri("/foo/bar?baz")
+                .body(Body::empty())
+                .unwrap();
+
+            let res = proxy.process_connect(req);
+
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
+        }
+    }
+
+    mod upgrade_websocket {
+        use super::*;
+
+        #[test]
+        fn returns_bad_request_if_missing_authority() {
+            let proxy = build_proxy();
+
+            let req = Request::builder()
+                .uri("/foo/bar?baz")
+                .body(Body::empty())
+                .unwrap();
+
+            let res = proxy.upgrade_websocket(req);
+
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
+        }
+
+        #[test]
+        fn returns_bad_request_if_missing_headers() {
+            let proxy = build_proxy();
+
+            let req = Request::builder()
+                .uri("http://example.com/foo/bar?baz")
+                .body(Body::empty())
+                .unwrap();
+
+            let res = proxy.upgrade_websocket(req);
+
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
         }
     }
 }

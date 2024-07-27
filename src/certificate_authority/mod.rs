@@ -3,9 +3,8 @@ mod openssl_authority;
 #[cfg(feature = "rcgen-ca")]
 mod rcgen_authority;
 
-use async_trait::async_trait;
 use http::uri::Authority;
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 use tokio_rustls::rustls::ServerConfig;
 
 #[cfg(feature = "openssl-ca")]
@@ -21,8 +20,10 @@ const NOT_BEFORE_OFFSET: i64 = 60;
 ///
 /// Clients should be configured to either trust the provided root certificate, or to ignore
 /// certificate errors.
-#[async_trait]
 pub trait CertificateAuthority: Send + Sync + 'static {
     /// Generate ServerConfig for use with rustls.
-    async fn gen_server_config(&self, authority: &Authority) -> Arc<ServerConfig>;
+    fn gen_server_config(
+        &self,
+        authority: &Authority,
+    ) -> impl Future<Output = Arc<ServerConfig>> + Send;
 }

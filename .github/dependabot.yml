@@ -9,6 +9,15 @@ updates:
     open-pull-requests-limit: 99
     reviewers:
       - omjadas
+    groups:
+      rustls:
+        patterns:
+          - "hyper-rustls"
+          - "tokio-rustls"
+      tungstenite:
+        patterns:
+          - "hyper-tungstenite"
+          - "tokio-tungstenite"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

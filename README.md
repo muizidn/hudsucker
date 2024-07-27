@@ -8,7 +8,7 @@ Hudsucker is a MITM HTTP/S proxy written in Rust that allows you to:
 
 - Modify HTTP/S requests
 - Modify HTTP/S responses
-- Modify websocket messages
+- Modify WebSocket messages
 
 ## Features
 
@@ -23,6 +23,10 @@ Hudsucker is a MITM HTTP/S proxy written in Rust that allows you to:
 ## Usage
 
 For usage, refer to the [provided examples](https://github.com/omjadas/hudsucker/tree/main/examples).
+
+### Built With Hudsucker
+
+- [Cruster](https://github.com/sinKettu/cruster)
 
 ## License
 

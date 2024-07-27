@@ -1,21 +1,19 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use hudsucker::{
     certificate_authority::{CertificateAuthority, RcgenAuthority},
-    hyper::{
-        client::connect::HttpConnector,
-        service::{make_service_fn, service_fn},
-        Body, Method, Request, Response, Server,
+    hyper::{body::Incoming, service::service_fn, Method, Request, Response},
+    hyper_util::{
+        client::legacy::{connect::HttpConnector, Client},
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto,
     },
-    rustls, Proxy,
+    rcgen::{CertificateParams, KeyPair},
+    Body, Proxy,
 };
 use reqwest::Certificate;
-use rustls_pemfile as pemfile;
-use std::{
-    convert::Infallible,
-    net::{SocketAddr, TcpListener},
-};
-use tls_listener::TlsListener;
-use tokio::sync::oneshot::Sender;
+use std::{convert::Infallible, net::SocketAddr};
+use tokio::{net::TcpListener, sync::oneshot::Sender};
+use tokio_graceful::Shutdown;
 use tokio_native_tls::native_tls;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -27,71 +25,102 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn build_ca() -> RcgenAuthority {
-    let mut private_key_bytes: &[u8] = include_bytes!("../examples/ca/hudsucker.key");
-    let mut ca_cert_bytes: &[u8] = include_bytes!("../examples/ca/hudsucker.cer");
-    let private_key = rustls::PrivateKey(
-        pemfile::pkcs8_private_keys(&mut private_key_bytes)
-            .expect("Failed to parse private key")
-            .remove(0),
-    );
-    let ca_cert = rustls::Certificate(
-        pemfile::certs(&mut ca_cert_bytes)
-            .expect("Failed to parse CA certificate")
-            .remove(0),
-    );
+    let key_pair = include_str!("../examples/ca/hudsucker.key");
+    let ca_cert = include_str!("../examples/ca/hudsucker.cer");
+    let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
+    let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
+        .expect("Failed to parse CA certificate")
+        .self_signed(&key_pair)
+        .expect("Failed to sign CA certificate");
 
-    RcgenAuthority::new(private_key, ca_cert, 1_000)
-        .expect("Failed to create Certificate Authority")
+    RcgenAuthority::new(key_pair, ca_cert, 1000)
 }
 
-async fn test_server(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn test_server(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/hello") => Ok(Response::new(Body::from("hello, world"))),
         _ => Ok(Response::new(Body::empty())),
     }
 }
 
-fn start_http_server() -> Result<(SocketAddr, Sender<()>), Box<dyn std::error::Error>> {
-    let make_svc = make_service_fn(|_| async { Ok::<_, Infallible>(service_fn(test_server)) });
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+pub async fn start_http_server() -> Result<(SocketAddr, Sender<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
-
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    tokio::spawn(
-        Server::from_tcp(listener)?
-            .serve(make_svc)
-            .with_graceful_shutdown(async { rx.await.unwrap_or_default() }),
-    );
+    tokio::spawn(async move {
+        let server = auto::Builder::new(TokioExecutor::new());
+        let shutdown = Shutdown::new(async { rx.await.unwrap_or_default() });
+        let guard = shutdown.guard_weak();
+
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (tcp, _) = res.unwrap();
+                    let server = server.clone();
+
+                    shutdown.spawn_task(async move {
+                        server
+                            .serve_connection_with_upgrades(TokioIo::new(tcp), service_fn(test_server))
+                            .await
+                            .unwrap();
+                    });
+                }
+                _ = guard.cancelled() => {
+                    break;
+                }
+            }
+        }
+
+        shutdown.shutdown().await;
+    });
 
     Ok((addr, tx))
 }
 
-async fn start_https_server() -> Result<(SocketAddr, Sender<()>), Box<dyn std::error::Error>> {
-    let make_svc = make_service_fn(|_| async { Ok::<_, Infallible>(service_fn(test_server)) });
-
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-    listener.set_nonblocking(true)?;
+pub async fn start_https_server(
+    ca: impl CertificateAuthority,
+) -> Result<(SocketAddr, Sender<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
-    let acceptor: tokio_rustls::TlsAcceptor = build_ca()
-        .gen_server_config(&format!("localhost:{}", addr.port()).parse().unwrap())
+    let acceptor: tokio_rustls::TlsAcceptor = ca
+        .gen_server_config(&"localhost".parse().unwrap())
         .await
         .into();
-    let listener = TlsListener::new(acceptor, tokio::net::TcpListener::from_std(listener)?);
-
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    tokio::spawn(
-        Server::builder(listener)
-            .serve(make_svc)
-            .with_graceful_shutdown(async { rx.await.unwrap_or_default() }),
-    );
+    tokio::spawn(async move {
+        let server = auto::Builder::new(TokioExecutor::new());
+        let shutdown = Shutdown::new(async { rx.await.unwrap_or_default() });
+        let guard = shutdown.guard_weak();
+
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (tcp, _) = res.unwrap();
+                    let tcp = acceptor.accept(tcp).await.unwrap();
+                    let server = server.clone();
+
+                    shutdown.spawn_task(async move {
+                        server
+                            .serve_connection_with_upgrades(TokioIo::new(tcp), service_fn(test_server))
+                            .await
+                            .unwrap();
+                    });
+                }
+                _ = guard.cancelled() => {
+                    break;
+                }
+            }
+        }
+
+        shutdown.shutdown().await;
+    });
 
     Ok((addr, tx))
 }
 
-fn native_tls_client() -> hyper::client::Client<hyper_tls::HttpsConnector<HttpConnector>> {
+fn native_tls_client() -> Client<hyper_tls::HttpsConnector<HttpConnector>, Body> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     let ca_cert =
@@ -103,27 +132,27 @@ fn native_tls_client() -> hyper::client::Client<hyper_tls::HttpsConnector<HttpCo
         .unwrap()
         .into();
 
-    let https: hyper_tls::HttpsConnector<HttpConnector> = (http, tls).into();
+    let https = (http, tls).into();
 
-    hyper::Client::builder().build(https)
+    Client::builder(TokioExecutor::new()).build(https)
 }
 
-fn start_proxy(
+async fn start_proxy(
     ca: impl CertificateAuthority,
 ) -> Result<(SocketAddr, Sender<()>), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-
     let proxy = Proxy::builder()
         .with_listener(listener)
         .with_client(native_tls_client())
         .with_ca(ca)
+        .with_graceful_shutdown(async {
+            rx.await.unwrap_or_default();
+        })
         .build();
 
-    tokio::spawn(proxy.start(async {
-        rx.await.unwrap_or_default();
-    }));
+    tokio::spawn(proxy.start());
 
     Ok((addr, tx))
 }
@@ -152,9 +181,9 @@ fn bench_local(c: &mut Criterion) {
     let runtime = runtime();
     let _guard = runtime.enter();
 
-    let (proxy_addr, stop_proxy) = start_proxy(build_ca()).unwrap();
-    let (http_addr, stop_http) = start_http_server().unwrap();
-    let (https_addr, stop_https) = runtime.block_on(start_https_server()).unwrap();
+    let (proxy_addr, stop_proxy) = runtime.block_on(start_proxy(build_ca())).unwrap();
+    let (http_addr, stop_http) = runtime.block_on(start_http_server()).unwrap();
+    let (https_addr, stop_https) = runtime.block_on(start_https_server(build_ca())).unwrap();
     let client = build_client();
     let proxied_client = build_proxied_client(&proxy_addr.to_string());
 
@@ -207,7 +236,7 @@ fn bench_remote(c: &mut Criterion) {
     let runtime = runtime();
     let _guard = runtime.enter();
 
-    let (proxy_addr, stop_proxy) = start_proxy(build_ca()).unwrap();
+    let (proxy_addr, stop_proxy) = runtime.block_on(start_proxy(build_ca())).unwrap();
     let client = build_client();
     let proxied_client = build_proxied_client(&proxy_addr.to_string());
 

@@ -1,68 +1,76 @@
-use crate::Error;
+use crate::{Body, Error};
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
 use bstr::ByteSlice;
-use bytes::Bytes;
 use futures::Stream;
 use hyper::{
+    body::{Body as HttpBody, Bytes},
     header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH},
-    Body, Error as HyperError, Request, Response,
+    Request, Response,
 };
 use std::{
     io,
-    io::Error as IoError,
     pin::Pin,
     task::{Context, Poll},
 };
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 use tokio_util::io::{ReaderStream, StreamReader};
 
-struct IoStream<T: Stream<Item = Result<Bytes, HyperError>> + Unpin>(T);
+struct IoStream<T>(T);
 
-impl<T: Stream<Item = Result<Bytes, HyperError>> + Unpin> Stream for IoStream<T> {
-    type Item = Result<Bytes, IoError>;
+impl<T: HttpBody<Data = Bytes, Error = Error> + Unpin> Stream for IoStream<T> {
+    type Item = Result<Bytes, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match futures::ready!(Pin::new(&mut self.0).poll_next(cx)) {
-            Some(Ok(chunk)) => Poll::Ready(Some(Ok(chunk))),
-            Some(Err(err)) => Poll::Ready(Some(Err(IoError::new(io::ErrorKind::Other, err)))),
-            None => Poll::Ready(None),
+        loop {
+            return match futures::ready!(Pin::new(&mut self.0).poll_frame(cx)) {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(buf) => Poll::Ready(Some(Ok(buf))),
+                    Err(_) => continue,
+                },
+                Some(Err(Error::Io(err))) => Poll::Ready(Some(Err(err))),
+                Some(Err(err)) => Poll::Ready(Some(Err(io::Error::other(err)))),
+                None => Poll::Ready(None),
+            };
         }
     }
 }
 
-enum Decoder {
-    Body(Body),
-    Decoder(Box<dyn AsyncRead + Send + Unpin>),
+fn decode(
+    encoding: &[u8],
+    reader: impl AsyncBufRead + Send + Sync + Unpin + 'static,
+) -> Result<Box<dyn AsyncRead + Send + Sync + Unpin>, Error> {
+    Ok(match encoding {
+        b"gzip" | b"x-gzip" => Box::new(GzipDecoder::new(reader)),
+        b"deflate" => Box::new(ZlibDecoder::new(reader)),
+        b"br" => Box::new(BrotliDecoder::new(reader)),
+        b"zstd" => Box::new(ZstdDecoder::new(reader)),
+        _ => Err(Error::Decode)?,
+    })
 }
 
-impl Decoder {
+enum Decoder<T> {
+    Body(T),
+    Decoder(Box<dyn AsyncRead + Send + Sync + Unpin>),
+}
+
+impl Decoder<Body> {
     pub fn decode(self, encoding: &[u8]) -> Result<Self, Error> {
         if encoding == b"identity" {
             return Ok(self);
         }
 
-        let reader: Box<dyn AsyncBufRead + Send + Unpin> = match self {
-            Self::Body(body) => Box::new(StreamReader::new(IoStream(body))),
-            Self::Decoder(decoder) => Box::new(BufReader::new(decoder)),
-        };
-
-        let decoder: Box<dyn AsyncRead + Send + Unpin> = match encoding {
-            b"gzip" | b"x-gzip" => Box::new(GzipDecoder::new(reader)),
-            b"deflate" => Box::new(ZlibDecoder::new(reader)),
-            b"br" => Box::new(BrotliDecoder::new(reader)),
-            b"zstd" => Box::new(ZstdDecoder::new(reader)),
-            _ => return Err(Error::Decode),
-        };
-
-        Ok(Self::Decoder(decoder))
+        Ok(Self::Decoder(match self {
+            Self::Body(body) => decode(encoding, StreamReader::new(IoStream(body))),
+            Self::Decoder(decoder) => decode(encoding, BufReader::new(decoder)),
+        }?))
     }
 }
 
-impl From<Decoder> for Body {
-    fn from(decoder: Decoder) -> Body {
+impl From<Decoder<Body>> for Body {
+    fn from(decoder: Decoder<Body>) -> Body {
         match decoder {
             Decoder::Body(body) => body,
-            Decoder::Decoder(decoder) => Body::wrap_stream(ReaderStream::new(decoder)),
+            Decoder::Decoder(decoder) => Body::from_stream(ReaderStream::new(decoder)),
         }
     }
 }
@@ -100,16 +108,12 @@ fn decode_body<'a>(
 ///
 /// ```rust
 /// use hudsucker::{
-///     async_trait::async_trait,
-///     decode_request,
-///     hyper::{Body, Request, Response},
-///     Error, HttpContext, HttpHandler, RequestOrResponse,
+///     decode_request, hyper::Request, Body, HttpContext, HttpHandler, RequestOrResponse,
 /// };
 ///
 /// #[derive(Clone)]
 /// pub struct MyHandler;
 ///
-/// #[async_trait]
 /// impl HttpHandler for MyHandler {
 ///     async fn handle_request(
 ///         &mut self,
@@ -159,19 +163,17 @@ pub fn decode_request(mut req: Request<Body>) -> Result<Request<Body>, Error> {
 /// # Examples
 ///
 /// ```rust
-/// use hudsucker::{
-///     async_trait::async_trait,
-///     decode_response,
-///     hyper::{Body, Request, Response},
-///     Error, HttpContext, HttpHandler, RequestOrResponse,
-/// };
+/// use hudsucker::{decode_response, hyper::Response, Body, HttpContext, HttpHandler};
 ///
 /// #[derive(Clone)]
 /// pub struct MyHandler;
 ///
-/// #[async_trait]
 /// impl HttpHandler for MyHandler {
-///     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
+///     async fn handle_response(
+///         &mut self,
+///         _ctx: &HttpContext,
+///         res: Response<Body>,
+///     ) -> Response<Body> {
 ///         let res = decode_response(res).unwrap();
 ///
 ///         // Do something with the response
@@ -265,10 +267,17 @@ mod tests {
         }
     }
 
+    async fn to_bytes<H: HttpBody>(body: H) -> Bytes
+    where
+        H::Error: std::fmt::Debug,
+    {
+        use http_body_util::BodyExt;
+        body.collect().await.unwrap().to_bytes()
+    }
+
     mod decode_body {
         use super::*;
         use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
-        use hyper::body::to_bytes;
 
         #[tokio::test]
         async fn no_encodings() {
@@ -276,7 +285,7 @@ mod tests {
             let body = Body::from(content);
 
             assert_eq!(
-                &to_bytes(decode_body(vec![], body).unwrap()).await.unwrap()[..],
+                &to_bytes(decode_body(vec![], body).unwrap()).await[..],
                 content.as_bytes()
             );
         }
@@ -287,9 +296,7 @@ mod tests {
             let body = Body::from(content);
 
             assert_eq!(
-                &to_bytes(decode_body(vec![&b"identity"[..]], body).unwrap())
-                    .await
-                    .unwrap()[..],
+                &to_bytes(decode_body(vec![&b"identity"[..]], body).unwrap()).await[..],
                 content.as_bytes()
             );
         }
@@ -298,12 +305,10 @@ mod tests {
         async fn single_encoding() {
             let content = b"hello, world";
             let encoder = GzipEncoder::new(&content[..]);
-            let body = Body::wrap_stream(ReaderStream::new(encoder));
+            let body = Body::from_stream(ReaderStream::new(encoder));
 
             assert_eq!(
-                &to_bytes(decode_body(vec![&b"gzip"[..]], body).unwrap())
-                    .await
-                    .unwrap()[..],
+                &to_bytes(decode_body(vec![&b"gzip"[..]], body).unwrap()).await[..],
                 content
             );
         }
@@ -313,12 +318,10 @@ mod tests {
             let content = b"hello, world";
             let encoder = GzipEncoder::new(&content[..]);
             let encoder = BrotliEncoder::new(BufReader::new(encoder));
-            let body = Body::wrap_stream(ReaderStream::new(encoder));
+            let body = Body::from_stream(ReaderStream::new(encoder));
 
             assert_eq!(
-                &to_bytes(decode_body(vec![&b"br"[..], &b"gzip"[..]], body).unwrap())
-                    .await
-                    .unwrap()[..],
+                &to_bytes(decode_body(vec![&b"br"[..], &b"gzip"[..]], body).unwrap()).await[..],
                 content
             );
         }
@@ -334,7 +337,6 @@ mod tests {
     mod decode_request {
         use super::*;
         use async_compression::tokio::bufread::GzipEncoder;
-        use hyper::body::to_bytes;
 
         #[tokio::test]
         async fn decodes_request() {
@@ -343,21 +345,20 @@ mod tests {
             let req = Request::builder()
                 .header(CONTENT_LENGTH, 123)
                 .header(CONTENT_ENCODING, "gzip")
-                .body(Body::wrap_stream(ReaderStream::new(encoder)))
+                .body(Body::from_stream(ReaderStream::new(encoder)))
                 .unwrap();
 
             let req = decode_request(req).unwrap();
 
             assert!(!req.headers().contains_key(CONTENT_LENGTH));
             assert!(!req.headers().contains_key(CONTENT_ENCODING));
-            assert_eq!(&to_bytes(req.into_body()).await.unwrap()[..], content);
+            assert_eq!(&to_bytes(req.into_body()).await[..], content);
         }
     }
 
     mod decode_response {
         use super::*;
         use async_compression::tokio::bufread::GzipEncoder;
-        use hyper::body::to_bytes;
 
         #[tokio::test]
         async fn decodes_response() {
@@ -366,14 +367,14 @@ mod tests {
             let res = Response::builder()
                 .header(CONTENT_LENGTH, 123)
                 .header(CONTENT_ENCODING, "gzip")
-                .body(Body::wrap_stream(ReaderStream::new(encoder)))
+                .body(Body::from_stream(ReaderStream::new(encoder)))
                 .unwrap();
 
             let res = decode_response(res).unwrap();
 
             assert!(!res.headers().contains_key(CONTENT_LENGTH));
             assert!(!res.headers().contains_key(CONTENT_ENCODING));
-            assert_eq!(&to_bytes(res.into_body()).await.unwrap()[..], content);
+            assert_eq!(&to_bytes(res.into_body()).await[..], content);
         }
     }
 }
