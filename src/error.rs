@@ -1,3 +1,4 @@
+use crate::builder;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,6 +10,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("unable to decode body")]
     Decode,
+    #[error("builder error")]
+    Builder(#[from] builder::Error),
     #[error("unknown error")]
     Unknown,
 }

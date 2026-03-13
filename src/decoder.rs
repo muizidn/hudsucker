@@ -3,9 +3,10 @@ use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder,
 use bstr::ByteSlice;
 use futures::Stream;
 use hyper::{
+    Request,
+    Response,
     body::{Body as HttpBody, Bytes},
-    header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH},
-    Request, Response,
+    header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, HeaderValue},
 };
 use std::{
     io,
@@ -100,15 +101,19 @@ fn decode_body<'a>(
 ///
 /// # Errors
 ///
-/// This will return an error if either of the `content-encoding` or `content-length` headers are
-/// unable to be parsed, or if one of the values specified in the `content-encoding` header is not
-/// supported.
+/// This will return an error if one of the values specified in the
+/// `content-encoding` header is not supported.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use hudsucker::{
-///     decode_request, hyper::Request, Body, HttpContext, HttpHandler, RequestOrResponse,
+///     Body,
+///     HttpContext,
+///     HttpHandler,
+///     RequestOrResponse,
+///     decode_request,
+///     hyper::Request,
 /// };
 ///
 /// #[derive(Clone)]
@@ -128,7 +133,6 @@ fn decode_body<'a>(
 ///     }
 /// }
 /// ```
-#[cfg_attr(docsrs, doc(cfg(feature = "decoder")))]
 pub fn decode_request(mut req: Request<Body>) -> Result<Request<Body>, Error> {
     if !req.headers().contains_key(CONTENT_ENCODING) {
         return Ok(req);
@@ -156,14 +160,13 @@ pub fn decode_request(mut req: Request<Body>) -> Result<Request<Body>, Error> {
 ///
 /// # Errors
 ///
-/// This will return an error if either of the `content-encoding` or `content-length` headers are
-/// unable to be parsed, or if one of the values specified in the `content-encoding` header is not
-/// supported.
+/// This will return an error if one of the values specified in the
+/// `content-encoding` header is not supported.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use hudsucker::{decode_response, hyper::Response, Body, HttpContext, HttpHandler};
+/// use hudsucker::{Body, HttpContext, HttpHandler, decode_response, hyper::Response};
 ///
 /// #[derive(Clone)]
 /// pub struct MyHandler;
@@ -182,7 +185,6 @@ pub fn decode_request(mut req: Request<Body>) -> Result<Request<Body>, Error> {
 ///     }
 /// }
 /// ```
-#[cfg_attr(docsrs, doc(cfg(feature = "decoder")))]
 pub fn decode_response(mut res: Response<Body>) -> Result<Response<Body>, Error> {
     if !res.headers().contains_key(CONTENT_ENCODING) {
         return Ok(res);

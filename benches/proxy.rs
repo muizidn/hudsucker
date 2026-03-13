@@ -1,14 +1,16 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use hudsucker::{
+    Body,
+    Proxy,
     certificate_authority::{CertificateAuthority, RcgenAuthority},
-    hyper::{body::Incoming, service::service_fn, Method, Request, Response},
+    hyper::{Method, Request, Response, body::Incoming, service::service_fn},
     hyper_util::{
-        client::legacy::{connect::HttpConnector, Client},
+        client::legacy::connect::HttpConnector,
         rt::{TokioExecutor, TokioIo},
         server::conn::auto,
     },
-    rcgen::{CertificateParams, KeyPair},
-    Body, Proxy,
+    rcgen::{Issuer, KeyPair},
+    rustls::crypto::aws_lc_rs,
 };
 use reqwest::Certificate;
 use std::{convert::Infallible, net::SocketAddr};
@@ -28,12 +30,10 @@ fn build_ca() -> RcgenAuthority {
     let key_pair = include_str!("../examples/ca/hudsucker.key");
     let ca_cert = include_str!("../examples/ca/hudsucker.cer");
     let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
-    let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
-        .expect("Failed to parse CA certificate")
-        .self_signed(&key_pair)
-        .expect("Failed to sign CA certificate");
+    let issuer =
+        Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
 
-    RcgenAuthority::new(key_pair, ca_cert, 1000)
+    RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider())
 }
 
 async fn test_server(req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
@@ -120,7 +120,7 @@ pub async fn start_https_server(
     Ok((addr, tx))
 }
 
-fn native_tls_client() -> Client<hyper_tls::HttpsConnector<HttpConnector>, Body> {
+fn native_tls_http_connector() -> hyper_tls::HttpsConnector<HttpConnector> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     let ca_cert =
@@ -132,9 +132,7 @@ fn native_tls_client() -> Client<hyper_tls::HttpsConnector<HttpConnector>, Body>
         .unwrap()
         .into();
 
-    let https = (http, tls).into();
-
-    Client::builder(TokioExecutor::new()).build(https)
+    (http, tls).into()
 }
 
 async fn start_proxy(
@@ -145,12 +143,13 @@ async fn start_proxy(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let proxy = Proxy::builder()
         .with_listener(listener)
-        .with_client(native_tls_client())
         .with_ca(ca)
+        .with_http_connector(native_tls_http_connector())
         .with_graceful_shutdown(async {
             rx.await.unwrap_or_default();
         })
-        .build();
+        .build()
+        .expect("Failed to create proxy");
 
     tokio::spawn(proxy.start());
 

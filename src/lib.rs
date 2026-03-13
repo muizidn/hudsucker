@@ -8,13 +8,20 @@
 //!
 //! ## Features
 //!
-//! - `decoder`: Enables [`decode_request`] and [`decode_response`] helpers (enabled by default).
+//! - `decoder`: Enables [`decode_request`] and [`decode_response`] helpers
+//!   (enabled by default).
 //! - `full`: Enables all features.
 //! - `http2`: Enables HTTP/2 support.
-//! - `native-tls-client`: Enables [`ProxyBuilder::with_native_tls_client`](builder::ProxyBuilder::with_native_tls_client).
-//! - `openssl-ca`: Enables [`OpensslAuthority`](certificate_authority::OpensslAuthority).
-//! - `rcgen-ca`: Enables [`RcgenAuthority`](certificate_authority::RcgenAuthority) (enabled by default).
-//! - `rustls-client`: Enables [`ProxyBuilder::with_rustls_client`](builder::ProxyBuilder::with_rustls_client) (enabled by default).
+//! - `native-tls-client`: Enables
+//!   [`ProxyBuilder::with_native_tls_connector`](builder::ProxyBuilder::with_native_tls_connector).
+//! - `openssl-ca`: Enables
+//!   [`OpensslAuthority`](certificate_authority::OpensslAuthority).
+//! - `rcgen-ca`: Enables
+//!   [`RcgenAuthority`](certificate_authority::RcgenAuthority) (enabled by
+//!   default).
+//! - `rustls-client`: Enables
+//!   [`ProxyBuilder::with_rustls_connector`](builder::ProxyBuilder::with_rustls_connector)
+//!   (enabled by default).
 
 mod body;
 #[cfg(feature = "decoder")]
@@ -28,7 +35,7 @@ pub mod certificate_authority;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use hyper::{Request, Response, StatusCode, Uri};
-use std::{future::Future, net::SocketAddr};
+use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::error;
 
@@ -103,9 +110,10 @@ pub enum WebSocketContext {
 ///
 /// Each request/response pair is passed to the same instance of the handler.
 pub trait HttpHandler: Clone + Send + Sync + 'static {
-    /// This handler will be called for each HTTP request. It can either return a modified request,
-    /// or a response. If a request is returned, it will be sent to the upstream server. If a
-    /// response is returned, it will be sent to the client.
+    /// This handler will be called for each HTTP request. It can either return
+    /// a modified request, or a response. If a request is returned, it will
+    /// be sent to the upstream server. If a response is returned, it will
+    /// be sent to the client.
     fn handle_request(
         &mut self,
         _ctx: &HttpContext,
@@ -114,8 +122,8 @@ pub trait HttpHandler: Clone + Send + Sync + 'static {
         async { req.into() }
     }
 
-    /// This handler will be called for each HTTP response. It can modify a response before it is
-    /// forwarded to the client.
+    /// This handler will be called for each HTTP response. It can modify a
+    /// response before it is forwarded to the client.
     fn handle_response(
         &mut self,
         _ctx: &HttpContext,
@@ -124,7 +132,8 @@ pub trait HttpHandler: Clone + Send + Sync + 'static {
         async { res }
     }
 
-    /// This handler will be called if a proxy request fails. Default response is a 502 Bad Gateway.
+    /// This handler will be called if a proxy request fails. Default response
+    /// is a 502 Bad Gateway.
     fn handle_error(
         &mut self,
         _ctx: &HttpContext,
@@ -139,7 +148,8 @@ pub trait HttpHandler: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Whether a CONNECT request should be intercepted. Defaults to `true` for all requests.
+    /// Whether a CONNECT request should be intercepted. Defaults to `true` for
+    /// all requests.
     fn should_intercept(
         &mut self,
         _ctx: &HttpContext,
@@ -151,10 +161,11 @@ pub trait HttpHandler: Clone + Send + Sync + 'static {
 
 /// Handler for WebSocket messages.
 ///
-/// Messages sent over the same WebSocket Stream are passed to the same instance of the handler.
+/// Messages sent over the same WebSocket Stream are passed to the same instance
+/// of the handler.
 pub trait WebSocketHandler: Clone + Send + Sync + 'static {
-    /// This handler is responsible for forwarding WebSocket messages from a Stream to a Sink and
-    /// recovering from any potential errors.
+    /// This handler is responsible for forwarding WebSocket messages from a
+    /// Stream to a Sink and recovering from any potential errors.
     fn handle_websocket(
         mut self,
         ctx: WebSocketContext,
@@ -191,8 +202,9 @@ pub trait WebSocketHandler: Clone + Send + Sync + 'static {
         }
     }
 
-    /// This handler will be called for each WebSocket message. It can return an optional modified
-    /// message. If None is returned the message will not be forwarded.
+    /// This handler will be called for each WebSocket message. It can return an
+    /// optional modified message. If None is returned the message will not
+    /// be forwarded.
     fn handle_message(
         &mut self,
         _ctx: &WebSocketContext,

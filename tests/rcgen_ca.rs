@@ -1,6 +1,7 @@
 use hudsucker::{
     certificate_authority::RcgenAuthority,
-    rcgen::{CertificateParams, KeyPair},
+    rcgen::{Issuer, KeyPair},
+    rustls::crypto::aws_lc_rs,
 };
 use std::sync::atomic::Ordering;
 
@@ -10,19 +11,17 @@ fn build_ca() -> RcgenAuthority {
     let key_pair = include_str!("../examples/ca/hudsucker.key");
     let ca_cert = include_str!("../examples/ca/hudsucker.cer");
     let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
-    let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
-        .expect("Failed to parse CA certificate")
-        .self_signed(&key_pair)
-        .expect("Failed to sign CA certificate");
+    let issuer =
+        Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
 
-    RcgenAuthority::new(key_pair, ca_cert, 1000)
+    RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider())
 }
 
 #[tokio::test]
 async fn https_rustls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::rustls_client(),
+        common::rustls_http_connector(),
         common::rustls_websocket_connector(),
     )
     .await
@@ -49,7 +48,7 @@ async fn https_rustls() {
 async fn https_native_tls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await
@@ -76,7 +75,7 @@ async fn https_native_tls() {
 async fn without_intercept() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy_without_intercept(
         build_ca(),
-        common::http_client(),
+        common::http_connector(),
         common::plain_websocket_connector(),
     )
     .await
@@ -103,7 +102,7 @@ async fn without_intercept() {
 async fn decodes_response() {
     let (proxy_addr, _, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await

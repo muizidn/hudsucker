@@ -1,6 +1,7 @@
 use hudsucker::{
     certificate_authority::OpensslAuthority,
     openssl::{hash::MessageDigest, pkey::PKey, x509::X509},
+    rustls::crypto::aws_lc_rs,
 };
 use std::sync::atomic::Ordering;
 
@@ -13,14 +14,20 @@ fn build_ca() -> OpensslAuthority {
         PKey::private_key_from_pem(private_key_bytes).expect("Failed to parse private key");
     let ca_cert = X509::from_pem(ca_cert_bytes).expect("Failed to parse CA certificate");
 
-    OpensslAuthority::new(private_key, ca_cert, MessageDigest::sha256(), 1_000)
+    OpensslAuthority::new(
+        private_key,
+        ca_cert,
+        MessageDigest::sha256(),
+        1_000,
+        aws_lc_rs::default_provider(),
+    )
 }
 
 #[tokio::test]
 async fn https_rustls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::rustls_client(),
+        common::rustls_http_connector(),
         common::rustls_websocket_connector(),
     )
     .await
@@ -47,7 +54,7 @@ async fn https_rustls() {
 async fn https_native_tls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await
@@ -74,7 +81,7 @@ async fn https_native_tls() {
 async fn without_intercept() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy_without_intercept(
         build_ca(),
-        common::http_client(),
+        common::http_connector(),
         common::plain_websocket_connector(),
     )
     .await
@@ -101,7 +108,7 @@ async fn without_intercept() {
 async fn decodes_response() {
     let (proxy_addr, _, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await

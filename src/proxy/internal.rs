@@ -1,29 +1,40 @@
 use crate::{
-    body::Body, certificate_authority::CertificateAuthority, rewind::Rewind, HttpContext,
-    HttpHandler, RequestOrResponse, WebSocketContext, WebSocketHandler,
+    HttpContext,
+    HttpHandler,
+    RequestOrResponse,
+    WebSocketContext,
+    WebSocketHandler,
+    body::Body,
+    certificate_authority::CertificateAuthority,
+    rewind::Rewind,
 };
 use futures::{Sink, Stream, StreamExt};
 use http::uri::{Authority, Scheme};
 use hyper::{
-    body::{Bytes, Incoming},
+    Method,
+    Request,
+    Response,
+    StatusCode,
+    Uri,
+    body::Incoming,
     header::Entry,
     service::service_fn,
     upgrade::Upgraded,
-    Method, Request, Response, StatusCode, Uri,
 };
 use hyper_util::{
-    client::legacy::{connect::Connect, Client},
+    client::legacy::{Client, connect::Connect},
     rt::{TokioExecutor, TokioIo},
-    server,
+    server::conn::auto::Builder as ServerBuilder,
 };
-use std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tokio::{io::AsyncReadExt, net::TcpStream, task::JoinHandle};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
+    Connector,
+    WebSocketStream,
     tungstenite::{self, Message},
-    Connector, WebSocketStream,
 };
-use tracing::{error, info_span, instrument, warn, Instrument, Span};
+use tracing::{Instrument, Span, error, info_span, instrument, warn};
 
 fn bad_request() -> Response<Body> {
     Response::builder()
@@ -42,7 +53,7 @@ fn spawn_with_trace<T: Send + Sync + 'static>(
 pub(crate) struct InternalProxy<C, CA, H, W> {
     pub ca: Arc<CA>,
     pub client: Client<C, Body>,
-    pub server: server::conn::auto::Builder<TokioExecutor>,
+    pub server: ServerBuilder<TokioExecutor>,
     pub http_handler: H,
     pub websocket_handler: W,
     pub websocket_connector: Option<Connector>,
@@ -150,10 +161,7 @@ where
                                 }
                             };
 
-                            let mut upgraded = Rewind::new(
-                                upgraded_io,
-                                Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
-                            );
+                            let mut upgraded = Rewind::new(upgraded_io, buffer, bytes_read);
 
                             if self
                                 .http_handler
@@ -423,7 +431,7 @@ mod tests {
         InternalProxy {
             ca: Arc::new(CA),
             client: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
-            server: server::conn::auto::Builder::new(TokioExecutor::new()),
+            server: ServerBuilder::new(TokioExecutor::new()),
             http_handler: crate::NoopHandler::new(),
             websocket_handler: crate::NoopHandler::new(),
             websocket_connector: None,

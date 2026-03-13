@@ -2,8 +2,9 @@ use async_http_proxy::http_connect_tokio;
 use futures::{SinkExt, StreamExt};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
-    rcgen::{CertificateParams, KeyPair},
-    tokio_tungstenite::tungstenite::Message,
+    rcgen::{Issuer, KeyPair},
+    rustls::crypto::aws_lc_rs,
+    tokio_tungstenite::tungstenite::{Message, Utf8Bytes},
 };
 use std::sync::atomic::Ordering;
 use tokio::net::TcpStream;
@@ -11,23 +12,23 @@ use tokio::net::TcpStream;
 #[allow(unused)]
 mod common;
 
+const HELLO: Utf8Bytes = Utf8Bytes::from_static("hello");
+
 fn build_ca() -> RcgenAuthority {
     let key_pair = include_str!("../examples/ca/hudsucker.key");
     let ca_cert = include_str!("../examples/ca/hudsucker.cer");
     let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
-    let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
-        .expect("Failed to parse CA certificate")
-        .self_signed(&key_pair)
-        .expect("Failed to sign CA certificate");
+    let issuer =
+        Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
 
-    RcgenAuthority::new(key_pair, ca_cert, 1000)
+    RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider())
 }
 
 #[tokio::test]
 async fn http() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await
@@ -48,11 +49,11 @@ async fn http() {
         .await
         .unwrap();
 
-    ws.send(Message::Text("hello".to_owned())).await.unwrap();
+    ws.send(Message::Text(HELLO)).await.unwrap();
 
     let msg = ws.next().await.unwrap().unwrap();
 
-    assert_eq!(msg.to_string(), common::WORLD);
+    assert_eq!(msg.into_text().unwrap(), common::WORLD);
     assert_eq!(handler.message_counter.load(Ordering::Relaxed), 2);
 
     stop_server.send(()).unwrap();
@@ -63,7 +64,7 @@ async fn http() {
 async fn https_rustls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::rustls_client(),
+        common::rustls_http_connector(),
         common::rustls_websocket_connector(),
     )
     .await
@@ -85,11 +86,11 @@ async fn https_rustls() {
     .await
     .unwrap();
 
-    ws.send(Message::Text("hello".to_owned())).await.unwrap();
+    ws.send(Message::Text(HELLO)).await.unwrap();
 
     let msg = ws.next().await.unwrap().unwrap();
 
-    assert_eq!(msg.to_string(), common::WORLD);
+    assert_eq!(msg.into_text().unwrap(), common::WORLD);
     assert_eq!(handler.message_counter.load(Ordering::Relaxed), 2);
 
     stop_server.send(()).unwrap();
@@ -100,7 +101,7 @@ async fn https_rustls() {
 async fn https_native_tls() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy(
         build_ca(),
-        common::native_tls_client(),
+        common::native_tls_http_connector(),
         common::native_tls_websocket_connector(),
     )
     .await
@@ -122,11 +123,11 @@ async fn https_native_tls() {
     .await
     .unwrap();
 
-    ws.send(Message::Text("hello".to_owned())).await.unwrap();
+    ws.send(Message::Text(HELLO)).await.unwrap();
 
     let msg = ws.next().await.unwrap().unwrap();
 
-    assert_eq!(msg.to_string(), common::WORLD);
+    assert_eq!(msg.into_text().unwrap(), common::WORLD);
     assert_eq!(handler.message_counter.load(Ordering::Relaxed), 2);
 
     stop_server.send(()).unwrap();
@@ -137,7 +138,7 @@ async fn https_native_tls() {
 async fn without_intercept() {
     let (proxy_addr, handler, stop_proxy) = common::start_proxy_without_intercept(
         build_ca(),
-        common::http_client(),
+        common::http_connector(),
         common::plain_websocket_connector(),
     )
     .await
@@ -158,11 +159,11 @@ async fn without_intercept() {
         .await
         .unwrap();
 
-    ws.send(Message::Text("hello".to_owned())).await.unwrap();
+    ws.send(Message::Text(HELLO)).await.unwrap();
 
     let msg = ws.next().await.unwrap().unwrap();
 
-    assert_eq!(msg.to_string(), common::WORLD);
+    assert_eq!(msg.into_text().unwrap(), common::WORLD);
     assert_eq!(handler.message_counter.load(Ordering::Relaxed), 0);
 
     stop_server.send(()).unwrap();
@@ -187,10 +188,10 @@ async fn noop() {
         .await
         .unwrap();
 
-    ws.send(Message::Text("hello".to_owned())).await.unwrap();
+    ws.send(Message::Text(HELLO)).await.unwrap();
     let msg = ws.next().await.unwrap().unwrap();
 
-    assert_eq!(msg.to_string(), common::WORLD);
+    assert_eq!(msg.into_text().unwrap(), common::WORLD);
 
     stop_server.send(()).unwrap();
     stop_proxy.send(()).unwrap();

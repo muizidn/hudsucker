@@ -3,18 +3,21 @@ mod internal;
 pub mod builder;
 
 use crate::{
-    builder::ProxyBuilder, certificate_authority::CertificateAuthority, Body, Error, HttpHandler,
+    Error,
+    HttpHandler,
     WebSocketHandler,
+    builder::ProxyBuilder,
+    certificate_authority::CertificateAuthority,
 };
 use builder::{AddrOrListener, WantsAddr};
 use hyper::service::service_fn;
 use hyper_util::{
-    client::legacy::{connect::Connect, Client},
+    client::legacy::{Builder as ClientBuilder, Client, connect::Connect},
     rt::{TokioExecutor, TokioIo},
-    server::conn::auto::{self, Builder},
+    server::conn::auto::Builder as ServerBuilder,
 };
 use internal::InternalProxy;
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_graceful::Shutdown;
 use tokio_tungstenite::Connector;
@@ -28,7 +31,8 @@ use tracing::error;
 /// use hudsucker::Proxy;
 /// # use hudsucker::{
 /// #     certificate_authority::RcgenAuthority,
-/// #     rcgen::{CertificateParams, KeyPair},
+/// #     rcgen::{Issuer, KeyPair},
+/// #     rustls::crypto::aws_lc_rs,
 /// # };
 /// #
 /// # #[cfg(all(feature = "rcgen-ca", feature = "rustls-client"))]
@@ -37,12 +41,10 @@ use tracing::error;
 /// # let key_pair = include_str!("../../examples/ca/hudsucker.key");
 /// # let ca_cert = include_str!("../../examples/ca/hudsucker.cer");
 /// # let key_pair = KeyPair::from_pem(key_pair).expect("Failed to parse private key");
-/// # let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert)
-/// #     .expect("Failed to parse CA certificate")
-/// #     .self_signed(&key_pair)
-/// #     .expect("Failed to sign CA certificate");
+/// # let issuer =
+/// #     Issuer::from_ca_cert_pem(ca_cert, key_pair).expect("Failed to parse CA certificate");
 /// #
-/// # let ca = RcgenAuthority::new(key_pair, ca_cert, 1_000);
+/// # let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
 ///
 /// // let ca = ...;
 ///
@@ -50,12 +52,13 @@ use tracing::error;
 ///
 /// let proxy = Proxy::builder()
 ///     .with_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-///     .with_rustls_client()
 ///     .with_ca(ca)
+///     .with_rustls_connector(aws_lc_rs::default_provider())
 ///     .with_graceful_shutdown(async {
 ///         done.await.unwrap_or_default();
 ///     })
-///     .build();
+///     .build()
+///     .expect("Failed to create proxy");
 ///
 /// tokio::spawn(proxy.start());
 ///
@@ -70,11 +73,12 @@ use tracing::error;
 pub struct Proxy<C, CA, H, W, F> {
     al: AddrOrListener,
     ca: Arc<CA>,
-    client: Client<C, Body>,
+    http_connector: C,
+    client: Option<ClientBuilder>,
     http_handler: H,
     websocket_handler: W,
     websocket_connector: Option<Connector>,
-    server: Option<Builder<TokioExecutor>>,
+    server: Option<ServerBuilder<TokioExecutor>>,
     graceful_shutdown: F,
 }
 
@@ -99,8 +103,19 @@ where
     ///
     /// This will return an error if the proxy server is unable to be started.
     pub async fn start(self) -> Result<(), Error> {
+        let client = self
+            .client
+            .unwrap_or_else(|| {
+                let mut builder = Client::builder(TokioExecutor::new());
+                builder
+                    .http1_title_case_headers(true)
+                    .http1_preserve_header_case(true);
+                builder
+            })
+            .build(self.http_connector);
+
         let server = self.server.unwrap_or_else(|| {
-            let mut builder = auto::Builder::new(TokioExecutor::new());
+            let mut builder = ServerBuilder::new(TokioExecutor::new());
             builder
                 .http1()
                 .title_case_headers(true)
@@ -127,8 +142,8 @@ where
                         }
                     };
 
+                    let client = client.clone();
                     let server = server.clone();
-                    let client = self.client.clone();
                     let ca = Arc::clone(&self.ca);
                     let http_handler = self.http_handler.clone();
                     let websocket_handler = self.websocket_handler.clone();
