@@ -75,8 +75,13 @@ impl RcgenAuthority {
             Ia5String::try_from(authority.host()).expect("Failed to create Ia5String"),
         ));
 
+        // Modern Extended Key Usage
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature, rcgen::KeyUsagePurpose::KeyEncipherment];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+
+        let leaf_key_pair = KeyPair::generate().expect("Failed to generate key pair");
         params
-            .signed_by(&self.key_pair, &self.ca_cert, &self.key_pair)
+            .signed_by(&leaf_key_pair, &self.ca_cert, &self.key_pair)
             .expect("Failed to sign certificate")
             .into()
     }
@@ -92,7 +97,9 @@ impl CertificateAuthority for RcgenAuthority {
 
         let certs = vec![self.gen_cert(authority)];
 
-        let mut server_cfg = ServerConfig::builder()
+        let mut server_cfg = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("Failed to build Default ServerConfig")
             .with_no_client_auth()
             .with_single_cert(certs, self.private_key.clone_key())
             .expect("Failed to build ServerConfig");

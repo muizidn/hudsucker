@@ -76,6 +76,8 @@ impl From<Response<Body>> for RequestOrResponse {
 pub struct HttpContext {
     /// Address of the client that is sending the request.
     pub client_addr: SocketAddr,
+    /// Whether the connection is intercepted (decrypted) or not.
+    pub intercepted: bool,
 }
 
 /// Context for websocket messages.

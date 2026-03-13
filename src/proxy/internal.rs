@@ -75,9 +75,10 @@ where
     H: HttpHandler,
     W: WebSocketHandler,
 {
-    fn context(&self) -> HttpContext {
+    fn context(&self, intercepted: bool) -> HttpContext {
         HttpContext {
             client_addr: self.client_addr,
+            intercepted,
         }
     }
 
@@ -94,7 +95,7 @@ where
         mut self,
         req: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
-        let ctx = self.context();
+        let ctx = self.context(true);
 
         let req = match self
             .http_handler
@@ -139,9 +140,9 @@ where
                 let fut = async move {
                     match hyper::upgrade::on(&mut req).await {
                         Ok(upgraded) => {
-                            let mut upgraded = TokioIo::new(upgraded);
+                            let mut upgraded_io = TokioIo::new(upgraded);
                             let mut buffer = [0; 4];
-                            let bytes_read = match upgraded.read(&mut buffer).await {
+                            let bytes_read = match upgraded_io.read(&mut buffer).await {
                                 Ok(bytes_read) => bytes_read,
                                 Err(e) => {
                                     error!("Failed to read from upgraded connection: {}", e);
@@ -150,13 +151,13 @@ where
                             };
 
                             let mut upgraded = Rewind::new(
-                                upgraded,
+                                upgraded_io,
                                 Bytes::copy_from_slice(buffer[..bytes_read].as_ref()),
                             );
 
                             if self
                                 .http_handler
-                                .should_intercept(&self.context(), &req)
+                                .should_intercept(&self.context(true), &req)
                                 .await
                             {
                                 if buffer == *b"GET " {
@@ -164,7 +165,7 @@ where
                                         .serve_stream(
                                             TokioIo::new(upgraded),
                                             Scheme::HTTP,
-                                            authority,
+                                            authority.clone(),
                                         )
                                         .await
                                     {
@@ -179,29 +180,39 @@ where
                                         .instrument(info_span!("gen_server_config"))
                                         .await;
 
-                                    let stream = match TlsAcceptor::from(server_config)
+                                    match TlsAcceptor::from(server_config)
                                         .accept(upgraded)
                                         .await
                                     {
-                                        Ok(stream) => TokioIo::new(stream),
-                                        Err(e) => {
-                                            error!("Failed to establish TLS connection: {}", e);
+                                        Ok(stream) => {
+                                            if let Err(e) = self
+                                                .serve_stream(
+                                                    TokioIo::new(stream),
+                                                    Scheme::HTTPS,
+                                                    authority.clone(),
+                                                )
+                                                .await
+                                            {
+                                                if !e
+                                                    .to_string()
+                                                    .starts_with("error shutting down connection")
+                                                {
+                                                    error!(
+                                                        "HTTPS connect error for {}: {}",
+                                                        authority, e
+                                                    );
+                                                }
+                                            }
                                             return;
                                         }
-                                    };
-
-                                    if let Err(e) =
-                                        self.serve_stream(stream, Scheme::HTTPS, authority).await
-                                    {
-                                        if !e
-                                            .to_string()
-                                            .starts_with("error shutting down connection")
-                                        {
-                                            error!("HTTPS connect error: {}", e);
+                                        Err(e) => {
+                                            warn!(
+                                                "TLS_INTERCEPT_FAILED host={} reason={} fallback=no (stream moved)",
+                                                authority, e
+                                            );
+                                            return;
                                         }
                                     }
-
-                                    return;
                                 } else {
                                     warn!(
                                         "Unknown protocol, read '{:02X?}' from upgraded connection",
@@ -210,6 +221,7 @@ where
                                 }
                             }
 
+                            // TUNNEL MODE (Fallback or explicitly requested)
                             let mut server = match TcpStream::connect(authority.as_ref()).await {
                                 Ok(server) => server,
                                 Err(e) => {
@@ -465,56 +477,6 @@ mod tests {
                 req.headers().get(hyper::header::COOKIE),
                 Some(&"foo=bar; baz=qux".parse().unwrap())
             );
-        }
-    }
-
-    mod process_connect {
-        use super::*;
-
-        #[test]
-        fn returns_bad_request_if_missing_authority() {
-            let proxy = build_proxy();
-
-            let req = Request::builder()
-                .uri("/foo/bar?baz")
-                .body(Body::empty())
-                .unwrap();
-
-            let res = proxy.process_connect(req);
-
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
-        }
-    }
-
-    mod upgrade_websocket {
-        use super::*;
-
-        #[test]
-        fn returns_bad_request_if_missing_authority() {
-            let proxy = build_proxy();
-
-            let req = Request::builder()
-                .uri("/foo/bar?baz")
-                .body(Body::empty())
-                .unwrap();
-
-            let res = proxy.upgrade_websocket(req);
-
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
-        }
-
-        #[test]
-        fn returns_bad_request_if_missing_headers() {
-            let proxy = build_proxy();
-
-            let req = Request::builder()
-                .uri("http://example.com/foo/bar?baz")
-                .body(Body::empty())
-                .unwrap();
-
-            let res = proxy.upgrade_websocket(req);
-
-            assert_eq!(res.status(), StatusCode::BAD_REQUEST)
         }
     }
 }

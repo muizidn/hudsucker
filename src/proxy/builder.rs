@@ -14,6 +14,8 @@ use hyper_util::{
     rt::TokioExecutor,
     server::conn::auto::Builder,
 };
+use rustls;
+use webpki_roots;
 use std::{
     future::{pending, Future, Pending},
     net::SocketAddr,
@@ -105,8 +107,19 @@ impl ProxyBuilder<WantsClient> {
     #[cfg(feature = "rustls-client")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-client")))]
     pub fn with_rustls_client(self) -> ProxyBuilder<WantsCa<RustlsConnector<HttpConnector>>> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("Failed to build Default ClientConfig")
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
+            .with_tls_config(config)
             .https_or_http()
             .enable_http1();
 
