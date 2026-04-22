@@ -58,6 +58,7 @@ pub(crate) struct InternalProxy<C, CA, H, W> {
     pub websocket_handler: W,
     pub websocket_connector: Option<Connector>,
     pub client_addr: SocketAddr,
+    pub intercepted: bool,
 }
 
 impl<C, CA, H, W> Clone for InternalProxy<C, CA, H, W>
@@ -75,6 +76,7 @@ where
             websocket_handler: self.websocket_handler.clone(),
             websocket_connector: self.websocket_connector.clone(),
             client_addr: self.client_addr,
+            intercepted: self.intercepted,
         }
     }
 }
@@ -86,10 +88,10 @@ where
     H: HttpHandler,
     W: WebSocketHandler,
 {
-    fn context(&self, intercepted: bool) -> HttpContext {
+    fn context(&self) -> HttpContext {
         HttpContext {
             client_addr: self.client_addr,
-            intercepted,
+            intercepted: self.intercepted,
         }
     }
 
@@ -106,7 +108,7 @@ where
         mut self,
         req: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
-        let ctx = self.context(true);
+        let ctx = self.context();
 
         let req = match self
             .http_handler
@@ -144,6 +146,23 @@ where
         }
     }
 
+    /// Handles a CONNECT request from a client.
+    ///
+    /// This method determines whether to intercept (MITM) the connection or simply tunnel it.
+    ///
+    /// 1. **Check Interception**: It calls `should_intercept` on the HTTP handler to decide
+    ///    if the connection should be decrypted.
+    /// 2. **Interception (MITM)**:
+    ///    - If the protocol is TLS (HTTPS), it generates a dynamic certificate for the requested
+    ///      authority and performs a TLS handshake with the client. The decrypted traffic is
+    ///      then handled by `serve_stream`.
+    ///    - If the protocol appears to be plain HTTP (often used for WebSockets over CONNECT),
+    ///      it is also handled by `serve_stream`.
+    /// 3. **Tunneling**:
+    ///    - If `should_intercept` returns `false`, or if interception fails, the proxy falls
+    ///      back to tunnel mode.
+    ///    - In tunnel mode, it establishes a raw TCP connection to the upstream server and
+    ///      blindly copies bytes between the client and the server without decryption.
     fn process_connect(mut self, mut req: Request<Body>) -> Response<Body> {
         match req.uri().authority().cloned() {
             Some(authority) => {
@@ -163,11 +182,13 @@ where
 
                             let mut upgraded = Rewind::new(upgraded_io, buffer, bytes_read);
 
+                            // Decide whether to intercept (MITM) or tunnel
                             if self
                                 .http_handler
-                                .should_intercept(&self.context(true), &req)
+                                .should_intercept(&self.context(), &req)
                                 .await
                             {
+                                // Interception Mode: Decrypt and process traffic
                                 if buffer == *b"GET " {
                                     if let Err(e) = self
                                         .serve_stream(
@@ -229,7 +250,8 @@ where
                                 }
                             }
 
-                            // TUNNEL MODE (Fallback or explicitly requested)
+                            // Tunnel Mode: Forward raw TCP bytes without decryption
+                            // This is used if should_intercept returns false or if interception failed
                             let mut server = match TcpStream::connect(authority.as_ref()).await {
                                 Ok(server) => server,
                                 Err(e) => {
@@ -376,9 +398,11 @@ where
                 };
 
                 req = Request::from_parts(parts, body);
-            };
+            }
 
-            self.clone().proxy(req)
+            let mut p = self.clone();
+            p.intercepted = true;
+            p.proxy(req)
         });
 
         self.server

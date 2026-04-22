@@ -161,6 +161,7 @@ where
                                     websocket_handler: websocket_handler.clone(),
                                     websocket_connector: websocket_connector.clone(),
                                     client_addr,
+                                    intercepted: false,
                                 }
                                 .proxy(req)
                             }),
