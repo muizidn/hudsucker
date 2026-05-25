@@ -188,116 +188,122 @@ where
                 let fut = async move {
                     match hyper::upgrade::on(&mut req).await {
                         Ok(upgraded) => {
-                            let mut upgraded_io = TokioIo::new(upgraded);
-                            let mut buffer = [0; 4];
-                            let bytes_read = match upgraded_io.read(&mut buffer).await {
-                                Ok(bytes_read) => bytes_read,
-                                Err(e) => {
-                                    error!("Failed to read from upgraded connection: {}", e);
-                                    return;
-                                }
-                            };
-
-                            let mut upgraded = Rewind::new(upgraded_io, buffer, bytes_read);
-
-                            // Decide whether to intercept (MITM) or tunnel
-                            if self
-                                .http_handler
-                                .should_intercept(&self.context(), &req)
-                                .await
-                            {
-                                // Interception Mode: Decrypt and process traffic
-                                if buffer == *b"GET " {
-                                    if let Err(e) = self
-                                        .serve_stream(
-                                            TokioIo::new(upgraded),
-                                            Scheme::HTTP,
-                                            authority.clone(),
-                                        )
-                                        .await
-                                    {
-                                        error!("WebSocket connect error: {}", e);
-                                    }
-
-                                    return;
-                                } else if buffer[..2] == *b"\x16\x03" {
-                                    let server_config = self
-                                        .ca
-                                        .gen_server_config(&authority)
-                                        .instrument(info_span!("gen_server_config"))
-                                        .await;
-
-                                    match TlsAcceptor::from(server_config)
-                                        .accept(upgraded)
-                                        .await
-                                    {
-                                        Ok(stream) => {
-                                            if let Err(e) = self
-                                                .serve_stream(
-                                                    TokioIo::new(stream),
-                                                    Scheme::HTTPS,
-                                                    authority.clone(),
-                                                )
-                                                .await
-                                            {
-                                                if !e
-                                                    .to_string()
-                                                    .starts_with("error shutting down connection")
-                                                {
-                                                    error!(
-                                                        "HTTPS connect error for {}: {}",
-                                                        authority, e
-                                                    );
-                                                }
-                                            }
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "TLS_INTERCEPT_FAILED host={} reason={} fallback=no (stream moved)",
-                                                authority, e
-                                            );
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "Unknown protocol, read '{:02X?}' from upgraded connection",
-                                        &buffer[..bytes_read]
-                                    );
-                                }
-                            }
-
-                            // Tunnel Mode: Forward raw TCP bytes without decryption
-                            // This is used if should_intercept returns false or if interception failed
-                            let mut server = match TcpStream::connect(authority.as_ref()).await {
-                                Ok(server) => server,
-                                Err(e) => {
-                                    error!("Failed to connect to {}: {}", authority, e);
-                                    return;
-                                }
-                            };
-
                             let key = authority.to_string();
+
+                            // Register shutdown channel BEFORE deciding MITM vs tunnel
+                            // so BOTH paths are interruptible on proxy rule changes
                             let shutdown_rx = if let Some(ref map) = self.tunnel_shutdown {
                                 let (tx, rx) = oneshot::channel();
                                 let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
                                 map.lock().await.entry(key.clone()).or_default().insert(tunnel_id, tx);
-                                println!("[TUNNEL_TRACK] Registered tunnel #{tunnel_id} for: {key}");
-                                Some((rx, key, tunnel_id, Arc::clone(map)))
+                                println!("[TUNNEL_TRACK] Registered connection #{tunnel_id} for: {key}");
+                                Some((rx, Arc::clone(map), key.clone(), tunnel_id))
                             } else {
-                                println!("[TUNNEL_TRACK] No tunnel shutdown map set! Tunnels won't be closeable.");
+                                println!("[TUNNEL_TRACK] No tunnel shutdown map set!");
                                 None
                             };
 
-                            match shutdown_rx {
-                                Some((rx, tunnel_key, tunnel_id, map)) => {
-                                    tokio::select! {
-                                        res = tokio::io::copy_bidirectional(&mut upgraded, &mut server) => {
-                                            if let Err(e) = res {
-                                                error!("Failed to tunnel to {}: {}", authority, e);
+                            let handle_connection = async {
+                                let mut upgraded_io = TokioIo::new(upgraded);
+                                let mut buffer = [0; 4];
+                                let bytes_read = match upgraded_io.read(&mut buffer).await {
+                                    Ok(bytes_read) => bytes_read,
+                                    Err(e) => {
+                                        error!("Failed to read from upgraded connection: {}", e);
+                                        return;
+                                    }
+                                };
+
+                                let mut upgraded = Rewind::new(upgraded_io, buffer, bytes_read);
+
+                                // Decide whether to intercept (MITM) or tunnel
+                                if self
+                                    .http_handler
+                                    .should_intercept(&self.context(), &req)
+                                    .await
+                                {
+                                    // Interception Mode: Decrypt and process traffic
+                                    if buffer == *b"GET " {
+                                        if let Err(e) = self
+                                            .serve_stream(
+                                                TokioIo::new(upgraded),
+                                                Scheme::HTTP,
+                                                authority.clone(),
+                                            )
+                                            .await
+                                        {
+                                            error!("WebSocket connect error: {}", e);
+                                        }
+                                        return;
+                                    } else if buffer[..2] == *b"\x16\x03" {
+                                        let server_config = self
+                                            .ca
+                                            .gen_server_config(&authority)
+                                            .instrument(info_span!("gen_server_config"))
+                                            .await;
+
+                                        match TlsAcceptor::from(server_config)
+                                            .accept(upgraded)
+                                            .await
+                                        {
+                                            Ok(stream) => {
+                                                if let Err(e) = self
+                                                    .serve_stream(
+                                                        TokioIo::new(stream),
+                                                        Scheme::HTTPS,
+                                                        authority.clone(),
+                                                    )
+                                                    .await
+                                                {
+                                                    if !e
+                                                        .to_string()
+                                                        .starts_with("error shutting down connection")
+                                                    {
+                                                        error!(
+                                                            "HTTPS connect error for {}: {}",
+                                                            authority, e
+                                                        );
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "TLS_INTERCEPT_FAILED host={} reason={} fallback=no (stream moved)",
+                                                    authority, e
+                                                );
+                                                return;
                                             }
                                         }
+                                    } else {
+                                        warn!(
+                                            "Unknown protocol, read '{:02X?}' from upgraded connection",
+                                            &buffer[..bytes_read]
+                                        );
+                                    }
+                                }
+
+                                // Tunnel Mode: Forward raw TCP bytes without decryption
+                                let mut server = match TcpStream::connect(authority.as_ref()).await {
+                                    Ok(server) => server,
+                                    Err(e) => {
+                                        error!("Failed to connect to {}: {}", authority, e);
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) =
+                                    tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                                {
+                                    error!("Failed to tunnel to {}: {}", authority, e);
+                                }
+                            };
+
+                            // Race the connection handler against the shutdown signal
+                            match shutdown_rx {
+                                Some((rx, map, tunnel_key, tunnel_id)) => {
+                                    tokio::select! {
+                                        _ = handle_connection => {}
                                         _ = rx => {}
                                     }
                                     map.lock().await
@@ -305,11 +311,7 @@ where
                                         .map(|host_map| host_map.remove(&tunnel_id));
                                 }
                                 None => {
-                                    if let Err(e) =
-                                        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
-                                    {
-                                        error!("Failed to tunnel to {}: {}", authority, e);
-                                    }
+                                    handle_connection.await;
                                 }
                             }
                         }
