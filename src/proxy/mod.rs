@@ -17,11 +17,15 @@ use hyper_util::{
     server::conn::auto::Builder as ServerBuilder,
 };
 use internal::InternalProxy;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex, oneshot};
 use tokio_graceful::Shutdown;
 use tokio_tungstenite::Connector;
 use tracing::error;
+
+pub type TunnelShutdownMap = Arc<Mutex<HashMap<String, HashMap<u64, oneshot::Sender<()>>>>>;
 
 /// A proxy server. This must be constructed with a [`ProxyBuilder`].
 ///
@@ -80,6 +84,7 @@ pub struct Proxy<C, CA, H, W, F> {
     websocket_connector: Option<Connector>,
     server: Option<ServerBuilder<TokioExecutor>>,
     graceful_shutdown: F,
+    pub tunnel_shutdown: Option<TunnelShutdownMap>,
 }
 
 impl Proxy<(), (), (), (), ()> {
@@ -148,6 +153,7 @@ where
                     let http_handler = self.http_handler.clone();
                     let websocket_handler = self.websocket_handler.clone();
                     let websocket_connector = self.websocket_connector.clone();
+                    let tunnel_shutdown = self.tunnel_shutdown.clone();
 
                     shutdown.spawn_task_fn(move |guard| async move {
                         let conn = server.serve_connection_with_upgrades(
@@ -162,6 +168,7 @@ where
                                     websocket_connector: websocket_connector.clone(),
                                     client_addr,
                                     intercepted: false,
+                                    tunnel_shutdown: tunnel_shutdown.clone(),
                                 }
                                 .proxy(req)
                             }),

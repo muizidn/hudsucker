@@ -26,8 +26,22 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
-use tokio::{io::AsyncReadExt, net::TcpStream, task::JoinHandle};
+use crate::proxy::TunnelShutdownMap;
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        atomic::AtomicU64,
+        atomic::Ordering,
+        Arc,
+    },
+};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpStream,
+    sync::oneshot,
+    task::JoinHandle,
+};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
     Connector,
@@ -50,6 +64,8 @@ fn spawn_with_trace<T: Send + Sync + 'static>(
     tokio::spawn(fut.instrument(span))
 }
 
+static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct InternalProxy<C, CA, H, W> {
     pub ca: Arc<CA>,
     pub client: Client<C, Body>,
@@ -59,6 +75,7 @@ pub(crate) struct InternalProxy<C, CA, H, W> {
     pub websocket_connector: Option<Connector>,
     pub client_addr: SocketAddr,
     pub intercepted: bool,
+    pub tunnel_shutdown: Option<TunnelShutdownMap>,
 }
 
 impl<C, CA, H, W> Clone for InternalProxy<C, CA, H, W>
@@ -77,6 +94,7 @@ where
             websocket_connector: self.websocket_connector.clone(),
             client_addr: self.client_addr,
             intercepted: self.intercepted,
+            tunnel_shutdown: self.tunnel_shutdown.clone(),
         }
     }
 }
@@ -260,10 +278,39 @@ where
                                 }
                             };
 
-                            if let Err(e) =
-                                tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
-                            {
-                                error!("Failed to tunnel to {}: {}", authority, e);
+                            let key = authority.to_string();
+                            let shutdown_rx = if let Some(ref map) = self.tunnel_shutdown {
+                                let (tx, rx) = oneshot::channel();
+                                let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+                                map.lock().await.entry(key.clone()).or_default().insert(tunnel_id, tx);
+                                println!("[TUNNEL_TRACK] Registered tunnel #{tunnel_id} for: {key}");
+                                Some((rx, key, tunnel_id, Arc::clone(map)))
+                            } else {
+                                println!("[TUNNEL_TRACK] No tunnel shutdown map set! Tunnels won't be closeable.");
+                                None
+                            };
+
+                            match shutdown_rx {
+                                Some((rx, tunnel_key, tunnel_id, map)) => {
+                                    tokio::select! {
+                                        res = tokio::io::copy_bidirectional(&mut upgraded, &mut server) => {
+                                            if let Err(e) = res {
+                                                error!("Failed to tunnel to {}: {}", authority, e);
+                                            }
+                                        }
+                                        _ = rx => {}
+                                    }
+                                    map.lock().await
+                                        .get_mut(&tunnel_key)
+                                        .map(|host_map| host_map.remove(&tunnel_id));
+                                }
+                                None => {
+                                    if let Err(e) =
+                                        tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                                    {
+                                        error!("Failed to tunnel to {}: {}", authority, e);
+                                    }
+                                }
                             }
                         }
                         Err(e) => error!("Upgrade error: {}", e),
@@ -460,6 +507,8 @@ mod tests {
             websocket_handler: crate::NoopHandler::new(),
             websocket_connector: None,
             client_addr: "127.0.0.1:8080".parse().unwrap(),
+            intercepted: false,
+            tunnel_shutdown: None,
         }
     }
 

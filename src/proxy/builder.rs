@@ -4,6 +4,7 @@ use crate::{
     Proxy,
     WebSocketHandler,
     certificate_authority::CertificateAuthority,
+    proxy::TunnelShutdownMap,
 };
 use hyper_util::{
     client::legacy::{Builder as ClientBuilder, connect::Connect},
@@ -151,6 +152,7 @@ impl<CA> ProxyBuilder<WantsClient<CA>> {
                     websocket_connector: None,
                     server: None,
                     graceful_shutdown: pending(),
+                    tunnel_shutdown: None,
                 });
             }
         };
@@ -175,6 +177,7 @@ impl<CA> ProxyBuilder<WantsClient<CA>> {
             websocket_connector: Some(Connector::Rustls(Arc::new(rustls_config))),
             server: None,
             graceful_shutdown: pending(),
+            tunnel_shutdown: None,
         })
     }
 
@@ -199,6 +202,7 @@ impl<CA> ProxyBuilder<WantsClient<CA>> {
                     websocket_connector: None,
                     server: None,
                     graceful_shutdown: pending(),
+                    tunnel_shutdown: None,
                 });
             }
         };
@@ -216,6 +220,7 @@ impl<CA> ProxyBuilder<WantsClient<CA>> {
             websocket_connector: Some(Connector::NativeTls(tls_connector)),
             server: None,
             graceful_shutdown: pending(),
+            tunnel_shutdown: None,
         })
     }
 
@@ -237,6 +242,7 @@ impl<CA> ProxyBuilder<WantsClient<CA>> {
             websocket_connector: None,
             server: None,
             graceful_shutdown: pending(),
+            tunnel_shutdown: None,
         })
     }
 }
@@ -252,6 +258,7 @@ pub struct WantsHandlers<CA, C, H, W, F> {
     websocket_connector: Option<Connector>,
     server: Option<ServerBuilder<TokioExecutor>>,
     graceful_shutdown: F,
+    tunnel_shutdown: Option<TunnelShutdownMap>,
 }
 
 impl<CA, C, H, W, F> ProxyBuilder<WantsHandlers<CA, C, H, W, F>> {
@@ -270,6 +277,7 @@ impl<CA, C, H, W, F> ProxyBuilder<WantsHandlers<CA, C, H, W, F>> {
             websocket_connector: self.0.websocket_connector,
             server: self.0.server,
             graceful_shutdown: self.0.graceful_shutdown,
+            tunnel_shutdown: self.0.tunnel_shutdown,
         })
     }
 
@@ -288,6 +296,7 @@ impl<CA, C, H, W, F> ProxyBuilder<WantsHandlers<CA, C, H, W, F>> {
             websocket_connector: self.0.websocket_connector,
             server: self.0.server,
             graceful_shutdown: self.0.graceful_shutdown,
+            tunnel_shutdown: self.0.tunnel_shutdown,
         })
     }
 
@@ -330,6 +339,18 @@ impl<CA, C, H, W, F> ProxyBuilder<WantsHandlers<CA, C, H, W, F>> {
             websocket_connector: self.0.websocket_connector,
             server: self.0.server,
             graceful_shutdown,
+            tunnel_shutdown: self.0.tunnel_shutdown,
+        })
+    }
+
+    /// Set the tunnel shutdown map for closing active CONNECT tunnels.
+    pub fn with_tunnel_shutdown(
+        self,
+        tunnel_shutdown: TunnelShutdownMap,
+    ) -> Self {
+        ProxyBuilder(WantsHandlers {
+            tunnel_shutdown: Some(tunnel_shutdown),
+            ..self.0
         })
     }
 
@@ -348,6 +369,7 @@ impl<CA, C, H, W, F> ProxyBuilder<WantsHandlers<CA, C, H, W, F>> {
             websocket_connector: self.0.websocket_connector,
             server: self.0.server,
             graceful_shutdown: self.0.graceful_shutdown,
+            tunnel_shutdown: self.0.tunnel_shutdown,
         })
     }
 }

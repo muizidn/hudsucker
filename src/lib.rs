@@ -28,7 +28,7 @@ mod body;
 mod decoder;
 mod error;
 mod noop;
-mod proxy;
+pub mod proxy;
 mod rewind;
 
 pub mod certificate_authority;
