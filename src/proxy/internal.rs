@@ -196,10 +196,8 @@ where
                                 let (tx, rx) = oneshot::channel();
                                 let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
                                 map.lock().await.entry(key.clone()).or_default().insert(tunnel_id, tx);
-                                println!("[TUNNEL_TRACK] Registered connection #{tunnel_id} for: {key}");
                                 Some((rx, Arc::clone(map), key.clone(), tunnel_id))
                             } else {
-                                println!("[TUNNEL_TRACK] No tunnel shutdown map set!");
                                 None
                             };
 
